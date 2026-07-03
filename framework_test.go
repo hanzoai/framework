@@ -40,6 +40,7 @@ func TestDocTypeValidate(t *testing.T) {
 		ok   bool
 	}{
 		{"ok", DocType{Name: "Task", Fields: []DocField{{Fieldname: "subject", Fieldtype: FieldData}}}, true},
+		{"richtext ok", DocType{Name: "Post", Fields: []DocField{{Fieldname: "body", Fieldtype: FieldRichText}}}, true},
 		{"no name", DocType{Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}}, false},
 		{"reserved name", DocType{Name: "doctypes", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}}, false},
 		{"no fields", DocType{Name: "Empty"}, false},
@@ -85,11 +86,15 @@ func TestFieldTypeValidation(t *testing.T) {
 		{Fieldname: "due", Fieldtype: FieldDate},
 		{Fieldname: "status", Fieldtype: FieldSelect, Options: "Open\nClosed"},
 		{Fieldname: "company", Fieldtype: FieldLink, Options: "Company"},
+		{Fieldname: "body", Fieldtype: FieldRichText},
 	}})
 
+	// A RichText value is an opaque Lexical EditorState JSON string; it must round-
+	// trip through validation verbatim (stored as-is, never re-shaped or rejected).
+	const lexical = `{"root":{"children":[{"children":[{"text":"Hello world"}],"type":"paragraph"}],"type":"root"}}`
 	good := map[string]any{
 		"code": "W1", "qty": float64(5), "price": 9.99, "active": true,
-		"due": "2026-07-02", "status": "Open", "company": comp.Name,
+		"due": "2026-07-02", "status": "Open", "company": comp.Name, "body": lexical,
 	}
 	out, err := s.validateDoc(ctx, org, &dt, good, nil, "", false)
 	if err != nil {
@@ -97,6 +102,9 @@ func TestFieldTypeValidation(t *testing.T) {
 	}
 	if out["qty"] != int64(5) || out["active"] != 1 || out["price"] != 9.99 || out["status"] != "Open" {
 		t.Fatalf("coercion mismatch: %+v", out)
+	}
+	if out["body"] != lexical {
+		t.Fatalf("richtext not round-tripped verbatim: %q", out["body"])
 	}
 
 	bad := []struct {
