@@ -64,6 +64,14 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 	app.Post("/v1/framework/roles", s.assignRole)
 	app.Delete("/v1/framework/roles/:user/:role", s.revokeRole)
 
+	// App-lane module fixtures: list the registered lanes, inspect one, and
+	// install its DocType fixtures into the caller's org. Registered BEFORE the
+	// generic /:doctype routes so "modules" resolves to these static handlers, and
+	// "modules" is a reserved DocType name so no document route can shadow them.
+	app.Get("/v1/framework/modules", s.listModules)
+	app.Get("/v1/framework/modules/:module", s.getModule)
+	app.Post("/v1/framework/modules/:module/install", s.installModule)
+
 	// GENERIC metadata-driven document surface.
 	app.Get("/v1/framework/:doctype", s.listDocuments)
 	app.Post("/v1/framework/:doctype", s.createDocument)
@@ -230,6 +238,96 @@ func (s *svc) revokeRole(c *zip.Ctx) error {
 		return zip.ErrNotFound("role assignment not found")
 	}
 	return c.NoContent(http.StatusNoContent)
+}
+
+// ---- Module (app-lane fixture) handlers ----
+
+// listModules reports the app lanes registered in this binary and the DocType
+// names each installs. Any validated member may read the catalog (it is
+// compile-time first-party data, not tenant data); installing is gated separately.
+func (s *svc) listModules(c *zip.Ctx) error {
+	if _, err := s.resolveAccess(c); err != nil {
+		return err
+	}
+	mods := registeredModules()
+	out := make([]map[string]any, 0, len(mods))
+	for _, m := range mods {
+		out = append(out, map[string]any{"module": m, "doctypes": fixtureNames(moduleFixtures(m))})
+	}
+	return c.JSON(http.StatusOK, map[string]any{"data": out})
+}
+
+// getModule reports one lane's fixtures and which of them are already installed in
+// the caller's org — the honest install-state the UI shows ("set up" vs "installed").
+func (s *svc) getModule(c *zip.Ctx) error {
+	acc, err := s.resolveAccess(c)
+	if err != nil {
+		return err
+	}
+	module := strings.TrimSpace(c.Param("module"))
+	fx := moduleFixtures(module)
+	if len(fx) == 0 {
+		return zip.ErrNotFound("unknown module: " + module)
+	}
+	installed := make([]string, 0, len(fx))
+	for _, dt := range fx {
+		if _, err := s.store.GetDocType(c.Context(), acc.org, dt.Name); err == nil {
+			installed = append(installed, dt.Name)
+		} else if !errors.Is(err, errNotFound) {
+			return mapErr(err, "")
+		}
+	}
+	return c.JSON(http.StatusOK, map[string]any{"module": module, "doctypes": fixtureNames(fx), "installed": installed})
+}
+
+// installModule ensures every registered DocType of a lane exists in the caller's
+// org. It is idempotent (create-if-absent — an org's customised DocType is NEVER
+// clobbered) and gated by managerOnly, so the org owner (System Manager, seeded
+// trust-on-first-use) installs a lane into their OWN tenant and no one else's. The
+// module name is stamped onto each fixture so the lane's DocTypes are discoverable
+// by `module`.
+func (s *svc) installModule(c *zip.Ctx) error {
+	acc, err := s.managerOnly(c)
+	if err != nil {
+		return err
+	}
+	module := strings.TrimSpace(c.Param("module"))
+	fx := moduleFixtures(module)
+	if len(fx) == 0 {
+		return zip.ErrNotFound("unknown module: " + module)
+	}
+	created := make([]string, 0, len(fx))
+	existing := make([]string, 0, len(fx))
+	for _, dt := range fx {
+		if _, err := s.store.GetDocType(c.Context(), acc.org, dt.Name); err == nil {
+			existing = append(existing, dt.Name)
+			continue
+		} else if !errors.Is(err, errNotFound) {
+			return mapErr(err, "")
+		}
+		dt.Module = module // the lane owns the module tag
+		if err := dt.Validate(); err != nil {
+			return zip.Errorf(http.StatusInternalServerError, "fixture %q invalid: %v", dt.Name, err)
+		}
+		if _, err := s.store.CreateDocType(c.Context(), acc.org, dt); err != nil {
+			if errors.Is(err, errConflict) { // lost a race with a concurrent install
+				existing = append(existing, dt.Name)
+				continue
+			}
+			return mapErr(err, "")
+		}
+		created = append(created, dt.Name)
+	}
+	return c.JSON(http.StatusOK, map[string]any{"module": module, "created": created, "existing": existing})
+}
+
+// fixtureNames returns the ordered DocType names of a fixture set.
+func fixtureNames(fx []DocType) []string {
+	names := make([]string, len(fx))
+	for i, dt := range fx {
+		names[i] = dt.Name
+	}
+	return names
 }
 
 // ---- Document handlers ----
