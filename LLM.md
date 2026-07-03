@@ -114,20 +114,28 @@ DocType registry: `GET/POST /v1/framework/doctypes`,
 `GET/PUT/DELETE /v1/framework/doctypes/:name`. Defining/replacing/deleting a
 DocType requires the **System Manager** role (or global admin).
 
-## Permissions (per-org, DocType perms by role)
+## Permissions (per-org, DocType perms by role) — secure by default
 
 The caller's role source is the framework's OWN per-org role store (IAM's JWT
 carries no roles into the cloud binary), managed at `/v1/framework/roles`
 (`GET`, `POST {user,role}`, `DELETE /:user/:role`). Enforcement:
 
 - **Global admin** (`c.IsAdmin()`, validated owner == AdminOrg) may do anything.
-- **Bootstrap**: an org with NO role assignments is unconfigured — a validated
-  member acts as **System Manager for their OWN org** (never another's) so they
-  can define doctypes, then lock down by assigning roles.
-- A DocType with **no** `permissions` is open to any validated org member (parity
-  with the existing per-org subsystems — never weaker).
+- **Owner seeding (trust-on-first-use)**: the FIRST validated principal to
+  administer an org that has no role assignments becomes its **System Manager**,
+  persisted ONCE — the org owner/creator. Every later member has no privilege
+  until the owner grants a role. Never crosses a tenant (org is the validated
+  tenant), and exactly one member is auto-granted (deterministically the first).
+- **Default-closed**: a DocType is NEVER open to all. A DocType declared with no
+  `permissions` is seeded a System Manager grant at define time and is therefore
+  manager-only; a role-less member is denied. There is no "empty perms = open"
+  path — the enforcement fails closed.
 - Otherwise, a right (`read`/`write`/`create`/`delete`/`submit`/`cancel`) is
   granted iff one of the caller's roles carries it in the DocType's `permissions`.
+
+This is stricter than the legacy per-org subsystems (where every org member shared
+org data): the Framework is the new canonical secure-by-default way, and those
+subsystems migrate onto it.
 
 ## Go hook interface (lifecycle extension)
 
