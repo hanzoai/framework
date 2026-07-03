@@ -610,6 +610,31 @@ func (s *Store) AssignRole(ctx context.Context, org, user, role string) error {
 	return nil
 }
 
+// SeedOwnerIfUnowned atomically grants `user` the System Manager role IFF the org
+// has NO role assignment yet — the trust-on-first-use owner seed. It is a SINGLE
+// conditional INSERT (INSERT ... SELECT ... WHERE NOT EXISTS), so the "is the org
+// unowned?" test and the insert are one statement: under concurrency EXACTLY ONE
+// caller's row lands (the rest match an org that now has a role and insert
+// nothing). Returns whether THIS caller became the seeded owner (RowsAffected==1).
+//
+// This replaces a check-then-insert (a SELECT for existing roles, then an INSERT)
+// whose window let several simultaneous first-callers each seed themselves System
+// Manager (Red measured 3–6). A UNIQUE index is deliberately NOT used: multiple SMs
+// are legitimate later, granted explicitly via AssignRole — only the AUTOMATIC
+// first-seed must be singular.
+func (s *Store) SeedOwnerIfUnowned(ctx context.Context, org, user string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO fw_roles (org, usr, role)
+		 SELECT ?, ?, ?
+		 WHERE NOT EXISTS (SELECT 1 FROM fw_roles WHERE org = ?)`,
+		org, user, RoleSystemManager, org)
+	if err != nil {
+		return false, fmt.Errorf("seed owner: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n == 1, nil
+}
+
 func (s *Store) RevokeRole(ctx context.Context, org, user, role string) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM fw_roles WHERE org=? AND usr=? AND role=?`, org, user, role)
 	if err != nil {
@@ -635,22 +660,6 @@ func (s *Store) RolesFor(ctx context.Context, org, user string) ([]string, error
 		out = append(out, r)
 	}
 	return out, rows.Err()
-}
-
-// OrgHasRoles reports whether an org has ANY role assignment — the bootstrap
-// predicate. An org with zero assignments is "unconfigured": a validated member
-// acts as System Manager for their OWN org (never another's) so they can define
-// doctypes and then lock down by assigning roles.
-func (s *Store) OrgHasRoles(ctx context.Context, org string) (bool, error) {
-	var one int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM fw_roles WHERE org=? LIMIT 1`, org).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("org has roles: %w", err)
-	}
-	return true, nil
 }
 
 // ---- small helpers ----

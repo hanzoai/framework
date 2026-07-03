@@ -4,6 +4,8 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -364,6 +366,54 @@ func TestHooks(t *testing.T) {
 	evNeg := &Event{Org: org, DocType: dt.Name, Doc: &neg, Meta: &dt, Store: s}
 	if err := runHooks(ctx, ActionOnSubmit, evNeg); err == nil {
 		t.Fatalf("on_submit gate should reject negative n")
+	}
+}
+
+// TestAtomicOwnerSeed proves the owner seed is singular under concurrency: N
+// simultaneous role-less first-callers on a fresh org yield EXACTLY ONE seeded
+// System Manager. The prior check-then-insert seeded 3–6 (the Red LOW); the
+// single conditional INSERT (SeedOwnerIfUnowned) makes "exactly one" true.
+func TestAtomicOwnerSeed(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	const org = "acme"
+	const n = 8
+
+	var (
+		wg          sync.WaitGroup
+		seededCount int32
+	)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			ok, err := s.SeedOwnerIfUnowned(ctx, org, "user"+itoa(i))
+			if err != nil {
+				t.Errorf("seed %d: %v", i, err)
+				return
+			}
+			if ok {
+				atomic.AddInt32(&seededCount, 1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if seededCount != 1 {
+		t.Fatalf("want exactly 1 caller to win the seed, got %d", seededCount)
+	}
+	roles, err := s.ListRoles(ctx, org)
+	if err != nil {
+		t.Fatalf("list roles: %v", err)
+	}
+	sm := 0
+	for _, r := range roles {
+		if r.Role == RoleSystemManager {
+			sm++
+		}
+	}
+	if sm != 1 {
+		t.Fatalf("want exactly 1 System Manager row, got %d (%+v)", sm, roles)
 	}
 }
 
