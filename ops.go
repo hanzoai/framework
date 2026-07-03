@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -137,7 +138,7 @@ func (s *svc) getDocType(c *zip.Ctx) error {
 	if err != nil {
 		return err
 	}
-	dt, err := s.store.GetDocType(c.Context(), acc.org, c.Param("name"))
+	dt, err := s.store.GetDocType(c.Context(), acc.org, pathParam(c, "name"))
 	if err != nil {
 		return mapErr(err, "doctype not found")
 	}
@@ -153,7 +154,7 @@ func (s *svc) replaceDocType(c *zip.Ctx) error {
 	if err := c.Bind(&dt); err != nil {
 		return err
 	}
-	dt.Name = strings.TrimSpace(c.Param("name")) // the URL is authoritative
+	dt.Name = pathParam(c, "name") // the URL is authoritative (decoded)
 	if err := dt.Validate(); err != nil {
 		return zip.ErrBadRequest(err.Error())
 	}
@@ -169,7 +170,7 @@ func (s *svc) deleteDocType(c *zip.Ctx) error {
 	if err != nil {
 		return err
 	}
-	deleted, err := s.store.DeleteDocType(c.Context(), acc.org, c.Param("name"))
+	deleted, err := s.store.DeleteDocType(c.Context(), acc.org, pathParam(c, "name"))
 	if err != nil {
 		return zip.Errorf(http.StatusInternalServerError, "delete doctype: %v", err)
 	}
@@ -221,7 +222,7 @@ func (s *svc) revokeRole(c *zip.Ctx) error {
 	if err != nil {
 		return err
 	}
-	revoked, err := s.store.RevokeRole(c.Context(), acc.org, c.Param("user"), c.Param("role"))
+	revoked, err := s.store.RevokeRole(c.Context(), acc.org, pathParam(c, "user"), pathParam(c, "role"))
 	if err != nil {
 		return zip.Errorf(http.StatusInternalServerError, "revoke role: %v", err)
 	}
@@ -446,7 +447,7 @@ func (s *svc) access(c *zip.Ctx, right string) (access, DocType, error) {
 	if err != nil {
 		return access{}, DocType{}, err
 	}
-	dt, err := s.store.GetDocType(c.Context(), acc.org, c.Param("doctype"))
+	dt, err := s.store.GetDocType(c.Context(), acc.org, pathParam(c, "doctype"))
 	if err != nil {
 		return access{}, DocType{}, mapErr(err, "doctype not found")
 	}
@@ -475,7 +476,25 @@ func (s *svc) docName(c *zip.Ctx, dt *DocType) string {
 	if dt.IsSingle {
 		return dt.Name
 	}
-	return strings.TrimSpace(c.Param("name"))
+	return pathParam(c, "name")
+}
+
+// pathParam reads a URL path parameter and percent-decodes it, so a segment that
+// names a record containing reserved characters — a space ("Sales Invoice",
+// "System Manager") arrives on the wire as %20 — is matched against its STORED
+// value, not its raw encoding. The router (zip over fasthttp) runs with Fiber's
+// default UnescapePath:false, so c.Param hands segments back verbatim; every
+// framework path segment names a stored DocType/document/role, so decoding is
+// correct HERE, in the ONE place the framework reads a path param. A malformed
+// escape is left as-is — it simply won't match any stored name (an honest 404),
+// never a panic. TrimSpace mirrors the naming rules (resolveName/Validate both
+// trim), so " Foo " and "Foo" address the same record.
+func pathParam(c *zip.Ctx, name string) string {
+	raw := c.Param(name)
+	if dec, err := url.PathUnescape(raw); err == nil {
+		raw = dec
+	}
+	return strings.TrimSpace(raw)
 }
 
 // getSingle returns the Single's document, or a virtual empty draft when it has
