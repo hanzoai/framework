@@ -127,14 +127,20 @@ func permGrants(p DocPerm, right string) bool {
 // managerOnly is the meta-permission gate for managing DocType definitions and
 // role assignments: only a manager may proceed.
 //
-// OWNER SEEDING (trust-on-first-use). The FIRST validated principal to administer
-// an org that has NO role assignments becomes its System Manager — persisted, ONCE
-// — i.e. the org owner/creator. Every later member has NO privilege until the
-// owner grants a role. This is strictly narrower than the previous "any member is
-// a manager until a role exists" and can NEVER cross a tenant (org is the
-// validated tenant, principal.Tenant). It resolves the setup chicken-and-egg (an
-// org with no roles could otherwise never define its first DocType) without a
-// footgun: exactly one member is auto-granted, deterministically the first setter.
+// OWNER SEEDING (trust-on-first-use, ATOMIC). The FIRST validated principal to
+// administer an org that has NO role assignments becomes its System Manager —
+// persisted, ONCE — i.e. the org owner/creator. Every later member has NO
+// privilege until the owner grants a role. This is strictly narrower than the
+// previous "any member is a manager until a role exists" and can NEVER cross a
+// tenant (org is the validated tenant, principal.Tenant). It resolves the setup
+// chicken-and-egg (an org with no roles could otherwise never define its first
+// DocType) without a footgun.
+//
+// The seed is a SINGLE conditional INSERT (store.SeedOwnerIfUnowned), so "exactly
+// one" holds under concurrency: the previous check-then-insert let several
+// simultaneous first-callers each seed themselves (Red measured 3–6). If our
+// insert did not win, we re-resolve — another request may have granted this user a
+// role in the race — and refuse only if still non-manager.
 func (s *svc) managerOnly(c *zip.Ctx) (access, error) {
 	acc, err := s.resolveAccess(c)
 	if err != nil {
@@ -143,17 +149,27 @@ func (s *svc) managerOnly(c *zip.Ctx) (access, error) {
 	if acc.manager {
 		return acc, nil
 	}
-	has, err := s.store.OrgHasRoles(c.Context(), acc.org)
+	seeded, err := s.store.SeedOwnerIfUnowned(c.Context(), acc.org, acc.user)
 	if err != nil {
-		return access{}, zip.Errorf(500, "role bootstrap: %v", err)
+		return access{}, zip.Errorf(500, "seed owner: %v", err)
 	}
-	if !has {
-		if err := s.store.AssignRole(c.Context(), acc.org, acc.user, RoleSystemManager); err != nil {
-			return access{}, zip.Errorf(500, "seed owner: %v", err)
-		}
+	if seeded {
 		acc.roles[RoleSystemManager] = true
 		acc.manager = true
 		return acc, nil
+	}
+	// Our seed did not win (the org is now owned). Re-resolve: a concurrent grant
+	// may have made this caller a manager; otherwise refuse.
+	assigned, err := s.store.RolesFor(c.Context(), acc.org, acc.user)
+	if err != nil {
+		return access{}, zip.Errorf(500, "resolve roles: %v", err)
+	}
+	for _, r := range assigned {
+		if r == RoleSystemManager {
+			acc.roles[r] = true
+			acc.manager = true
+			return acc, nil
+		}
 	}
 	return access{}, zip.ErrForbidden("System Manager role required")
 }
