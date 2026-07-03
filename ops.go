@@ -242,6 +242,11 @@ func (s *svc) createDocument(c *zip.Ctx) error {
 	if err != nil {
 		return err
 	}
+	// A Single has exactly one document; create and update are the SAME upsert,
+	// guarded identically (draft-only). Route both through writeSingle.
+	if dt.IsSingle {
+		return s.writeSingle(c, acc, &dt, in, http.StatusCreated)
+	}
 	validated, err := s.store.validateDoc(c.Context(), acc.org, &dt, in, nil, "", false)
 	if err != nil {
 		return mapErr(err, "")
@@ -254,13 +259,7 @@ func (s *svc) createDocument(c *zip.Ctx) error {
 	if err := runHooks(c.Context(), ActionBeforeSave, ev); err != nil {
 		return hookErr(err)
 	}
-
-	var saved Document
-	if dt.IsSingle {
-		saved, err = s.store.UpsertSingle(c.Context(), acc.org, &dt, doc.Data)
-	} else {
-		saved, err = s.store.CreateDocument(c.Context(), acc.org, &dt, doc.Data, stringField(in, "name"))
-	}
+	saved, err := s.store.CreateDocument(c.Context(), acc.org, &dt, doc.Data, stringField(in, "name"))
 	if err != nil {
 		return mapErr(err, "")
 	}
@@ -324,26 +323,10 @@ func (s *svc) updateDocument(c *zip.Ctx) error {
 	if err != nil {
 		return err
 	}
-	name := s.docName(c, &dt)
-
-	// Single: upsert; no prior-status guard (a single is always a draft).
 	if dt.IsSingle {
-		validated, err := s.store.validateDoc(c.Context(), acc.org, &dt, in, nil, "", false)
-		if err != nil {
-			return mapErr(err, "")
-		}
-		doc := Document{DocType: dt.Name, Name: dt.Name, Data: validated}
-		ev := s.event(acc.org, &dt, &doc, nil)
-		if err := runHooks(c.Context(), ActionBeforeSave, ev); err != nil {
-			return hookErr(err)
-		}
-		saved, err := s.store.UpsertSingle(c.Context(), acc.org, &dt, doc.Data)
-		if err != nil {
-			return mapErr(err, "")
-		}
-		s.after(c.Context(), acc.org, &dt, &saved, nil)
-		return c.JSON(http.StatusOK, wireDoc(&dt, saved, nil))
+		return s.writeSingle(c, acc, &dt, in, http.StatusOK)
 	}
+	name := s.docName(c, &dt)
 
 	prev, err := s.store.GetDocument(c.Context(), acc.org, dt.Name, name)
 	if err != nil {
@@ -503,6 +486,40 @@ func (s *svc) getSingle(ctx context.Context, org string, dt *DocType) (Document,
 		return Document{Name: dt.Name, DocType: dt.Name, Data: map[string]any{}}, nil
 	}
 	return doc, err
+}
+
+// writeSingle upserts the ONE document of a Single DocType (name == doctype
+// name), used by both POST and PUT. It enforces the SAME immutability as the
+// non-Single path — a submitted/cancelled Single (docstatus != 0) is not editable
+// (409) — and preserves a redacted Password across an unchanged update by passing
+// the current data as `prev` to the validator. Without this guard UpsertSingle
+// would silently mutate a submitted Single (the LOW-1 finding).
+func (s *svc) writeSingle(c *zip.Ctx, acc access, dt *DocType, in map[string]any, okStatus int) error {
+	cur, curErr := s.store.GetDocument(c.Context(), acc.org, dt.Name, dt.Name)
+	var prev map[string]any
+	if curErr == nil {
+		if cur.DocStatus != 0 {
+			return zip.Errorf(http.StatusConflict, "document is not a draft (docstatus %d); cannot edit", cur.DocStatus)
+		}
+		prev = cur.Data
+	} else if curErr != errNotFound {
+		return mapErr(curErr, "")
+	}
+	validated, err := s.store.validateDoc(c.Context(), acc.org, dt, in, prev, dt.Name, false)
+	if err != nil {
+		return mapErr(err, "")
+	}
+	doc := Document{DocType: dt.Name, Name: dt.Name, Data: validated}
+	ev := s.event(acc.org, dt, &doc, nil)
+	if err := runHooks(c.Context(), ActionBeforeSave, ev); err != nil {
+		return hookErr(err)
+	}
+	saved, err := s.store.UpsertSingle(c.Context(), acc.org, dt, doc.Data)
+	if err != nil {
+		return mapErr(err, "")
+	}
+	s.after(c.Context(), acc.org, dt, &saved, nil)
+	return c.JSON(okStatus, wireDoc(dt, saved, nil))
 }
 
 // ---- wire helpers ----

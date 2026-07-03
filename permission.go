@@ -72,36 +72,26 @@ func (s *svc) resolveAccess(c *zip.Ctx) (access, error) {
 			acc.manager = true
 		}
 	}
-
-	// Bootstrap: an org with NO role assignments is unconfigured — a validated
-	// member acts as System Manager for their OWN org (never another's, since org
-	// is the validated tenant) so they can define doctypes, then lock down by
-	// assigning roles. Once the first role is assigned, strict enforcement applies.
-	if !acc.manager {
-		has, err := s.store.OrgHasRoles(c.Context(), org)
-		if err != nil {
-			return access{}, zip.Errorf(500, "role bootstrap: %v", err)
-		}
-		if !has {
-			acc.manager = true
-			acc.roles[RoleSystemManager] = true
-		}
-	}
+	// No implicit manager here: a member's authority is EXACTLY their assigned
+	// roles (plus global admin above). The one-time owner seeding lives in
+	// managerOnly, so a role-less member is never silently a manager on the read /
+	// document-CRUD path — permless doctypes are default-closed (see can).
 	return acc, nil
 }
 
 // can reports whether the caller may perform `right` on a document of dt.
 //
-//   - A manager (System Manager / global admin / bootstrap) may do anything.
-//   - A DocType with NO permissions is open to any validated org member (parity
-//     with the existing per-org subsystems, e.g. crm — never weaker).
+//   - A manager (System Manager / global admin) may do anything.
 //   - Otherwise, at least one of the caller's roles must carry `right` in the
 //     DocType's permission rows.
+//
+// SECURE BY DEFAULT: there is NO "empty perms means open to all" branch. A
+// DocType with no role grants is manager-only, never open to every org member —
+// the DENY default. (DocType define-time seeds a System Manager grant, so a
+// stored doctype is never silently permless; this loop is the enforcement, and it
+// fails closed for a role-less member regardless.)
 func (a access) can(dt *DocType, right string) bool {
 	if a.manager {
-		return true
-	}
-	if len(dt.Perms) == 0 {
 		return true
 	}
 	for _, p := range dt.Perms {
@@ -136,13 +126,34 @@ func permGrants(p DocPerm, right string) bool {
 
 // managerOnly is the meta-permission gate for managing DocType definitions and
 // role assignments: only a manager may proceed.
+//
+// OWNER SEEDING (trust-on-first-use). The FIRST validated principal to administer
+// an org that has NO role assignments becomes its System Manager — persisted, ONCE
+// — i.e. the org owner/creator. Every later member has NO privilege until the
+// owner grants a role. This is strictly narrower than the previous "any member is
+// a manager until a role exists" and can NEVER cross a tenant (org is the
+// validated tenant, principal.Tenant). It resolves the setup chicken-and-egg (an
+// org with no roles could otherwise never define its first DocType) without a
+// footgun: exactly one member is auto-granted, deterministically the first setter.
 func (s *svc) managerOnly(c *zip.Ctx) (access, error) {
 	acc, err := s.resolveAccess(c)
 	if err != nil {
 		return access{}, err
 	}
-	if !acc.manager {
-		return access{}, zip.ErrForbidden("System Manager role required")
+	if acc.manager {
+		return acc, nil
 	}
-	return acc, nil
+	has, err := s.store.OrgHasRoles(c.Context(), acc.org)
+	if err != nil {
+		return access{}, zip.Errorf(500, "role bootstrap: %v", err)
+	}
+	if !has {
+		if err := s.store.AssignRole(c.Context(), acc.org, acc.user, RoleSystemManager); err != nil {
+			return access{}, zip.Errorf(500, "seed owner: %v", err)
+		}
+		acc.roles[RoleSystemManager] = true
+		acc.manager = true
+		return acc, nil
+	}
+	return access{}, zip.ErrForbidden("System Manager role required")
 }
