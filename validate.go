@@ -199,7 +199,9 @@ func (s *Store) applyFetchFrom(ctx context.Context, org string, dt *DocType, out
 // field-type validation — the gate RED must not be able to bypass.
 func coerceField(f DocField, raw any) (any, error) {
 	switch f.Fieldtype {
-	case FieldData, FieldText, FieldSmall, FieldLong, FieldAttach:
+	case FieldData, FieldText, FieldSmall, FieldLong, FieldRichText, FieldAttach:
+		// RichText is an opaque Lexical EditorState JSON string — stored verbatim
+		// (clipped to the scalar bound) like any text; its shape is a UI concern.
 		s, err := asString(f, raw)
 		if err != nil {
 			return nil, err
