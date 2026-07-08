@@ -87,13 +87,7 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 
 func init() {
 	cloud.RegisterWithShutdown("framework", 129,
-		func(app any, deps cloud.Deps) error {
-			a, ok := app.(*zip.App)
-			if !ok {
-				return fmt.Errorf("framework.Mount: app is %T, want *zip.App", app)
-			}
-			return Mount(a, deps)
-		},
+		cloud.Typed(Mount),
 		func(ctx context.Context) error { return Shutdown() },
 	)
 }
