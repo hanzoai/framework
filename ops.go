@@ -13,18 +13,17 @@ import (
 	"strings"
 
 	"github.com/hanzoai/cloud"
-	luxlog "github.com/luxfi/log"
 	"github.com/zap-proto/zip"
 )
 
-type svc struct {
+// state is framework's own data; the shared deps (logger, brand) live in the
+// embedded cloud.Base, reached as s.Log / s.Brand — never re-plumbed here.
+type state struct {
 	store *Store
-	log   luxlog.Logger
-	brand string
 }
 
 // mounted is the active service so Shutdown can release the store.
-var mounted *svc
+var mounted *cloud.Service[state]
 
 // Mount wires the framework surface onto app per HIP-0106.
 func Mount(app *zip.App, deps cloud.Deps) error {
@@ -46,40 +45,42 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 	if err != nil {
 		return fmt.Errorf("framework.Mount: open store: %w", err)
 	}
-	s := &svc{store: store, log: log, brand: deps.Brand}
+	// framework is a "complex" mount (package-global `mounted`, a shutdown that
+	// closes the store), so it builds the Service value directly.
+	s := &cloud.Service[state]{Base: cloud.NewBase(deps, "framework"), State: state{store: store}}
 	mounted = s
 
 	// STATIC routes register BEFORE the generic /:doctype routes so Fiber's
 	// first-match scan resolves them unambiguously; their names are also reserved
 	// DocType names (see reservedDocTypeNames), so no document route can shadow them.
-	app.Get("/v1/framework/summary", s.summary)
+	app.Get("/v1/framework/summary", cloud.Handle(s, summary))
 
-	app.Get("/v1/framework/doctypes", s.listDocTypes)
-	app.Post("/v1/framework/doctypes", s.createDocType)
-	app.Get("/v1/framework/doctypes/:name", s.getDocType)
-	app.Put("/v1/framework/doctypes/:name", s.replaceDocType)
-	app.Delete("/v1/framework/doctypes/:name", s.deleteDocType)
+	app.Get("/v1/framework/doctypes", cloud.Handle(s, listDocTypes))
+	app.Post("/v1/framework/doctypes", cloud.Handle(s, createDocType))
+	app.Get("/v1/framework/doctypes/:name", cloud.Handle(s, getDocType))
+	app.Put("/v1/framework/doctypes/:name", cloud.Handle(s, replaceDocType))
+	app.Delete("/v1/framework/doctypes/:name", cloud.Handle(s, deleteDocType))
 
-	app.Get("/v1/framework/roles", s.listRoles)
-	app.Post("/v1/framework/roles", s.assignRole)
-	app.Delete("/v1/framework/roles/:user/:role", s.revokeRole)
+	app.Get("/v1/framework/roles", cloud.Handle(s, listRoles))
+	app.Post("/v1/framework/roles", cloud.Handle(s, assignRole))
+	app.Delete("/v1/framework/roles/:user/:role", cloud.Handle(s, revokeRole))
 
 	// App-lane module fixtures: list the registered lanes, inspect one, and
 	// install its DocType fixtures into the caller's org. Registered BEFORE the
 	// generic /:doctype routes so "modules" resolves to these static handlers, and
 	// "modules" is a reserved DocType name so no document route can shadow them.
-	app.Get("/v1/framework/modules", s.listModules)
-	app.Get("/v1/framework/modules/:module", s.getModule)
-	app.Post("/v1/framework/modules/:module/install", s.installModule)
+	app.Get("/v1/framework/modules", cloud.Handle(s, listModules))
+	app.Get("/v1/framework/modules/:module", cloud.Handle(s, getModule))
+	app.Post("/v1/framework/modules/:module/install", cloud.Handle(s, installModule))
 
 	// GENERIC metadata-driven document surface.
-	app.Get("/v1/framework/:doctype", s.listDocuments)
-	app.Post("/v1/framework/:doctype", s.createDocument)
-	app.Get("/v1/framework/:doctype/:name", s.getDocument)
-	app.Put("/v1/framework/:doctype/:name", s.updateDocument)
-	app.Delete("/v1/framework/:doctype/:name", s.deleteDocument)
-	app.Post("/v1/framework/:doctype/:name/submit", s.submitDocument)
-	app.Post("/v1/framework/:doctype/:name/cancel", s.cancelDocument)
+	app.Get("/v1/framework/:doctype", cloud.Handle(s, listDocuments))
+	app.Post("/v1/framework/:doctype", cloud.Handle(s, createDocument))
+	app.Get("/v1/framework/:doctype/:name", cloud.Handle(s, getDocument))
+	app.Put("/v1/framework/:doctype/:name", cloud.Handle(s, updateDocument))
+	app.Delete("/v1/framework/:doctype/:name", cloud.Handle(s, deleteDocument))
+	app.Post("/v1/framework/:doctype/:name/submit", cloud.Handle(s, submitDocument))
+	app.Post("/v1/framework/:doctype/:name/cancel", cloud.Handle(s, cancelDocument))
 
 	log.Info("framework mounted", "brand", deps.Brand)
 	return nil
@@ -94,18 +95,18 @@ func init() {
 
 // Shutdown closes the framework store. Idempotent.
 func Shutdown() error {
-	if mounted == nil || mounted.store == nil {
+	if mounted == nil || mounted.State.store == nil {
 		return nil
 	}
-	err := mounted.store.Close()
+	err := mounted.State.store.Close()
 	mounted = nil
 	return err
 }
 
 // ---- DocType registry handlers ----
 
-func (s *svc) createDocType(c *zip.Ctx) error {
-	acc, err := s.managerOnly(c)
+func createDocType(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, err := managerOnly(s, c)
 	if err != nil {
 		return err
 	}
@@ -116,39 +117,39 @@ func (s *svc) createDocType(c *zip.Ctx) error {
 	if err := dt.Validate(); err != nil {
 		return zip.ErrBadRequest(err.Error())
 	}
-	saved, err := s.store.CreateDocType(c.Context(), acc.org, dt)
+	saved, err := s.State.store.CreateDocType(c.Context(), acc.org, dt)
 	if err != nil {
 		return mapErr(err, "")
 	}
 	return c.JSON(http.StatusCreated, saved)
 }
 
-func (s *svc) listDocTypes(c *zip.Ctx) error {
-	acc, err := s.resolveAccess(c)
+func listDocTypes(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, err := resolveAccess(s, c)
 	if err != nil {
 		return err
 	}
-	rows, err := s.store.ListDocTypes(c.Context(), acc.org)
+	rows, err := s.State.store.ListDocTypes(c.Context(), acc.org)
 	if err != nil {
 		return zip.Errorf(http.StatusInternalServerError, "list doctypes: %v", err)
 	}
 	return c.JSON(http.StatusOK, map[string]any{"data": rows})
 }
 
-func (s *svc) getDocType(c *zip.Ctx) error {
-	acc, err := s.resolveAccess(c)
+func getDocType(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, err := resolveAccess(s, c)
 	if err != nil {
 		return err
 	}
-	dt, err := s.store.GetDocType(c.Context(), acc.org, pathParam(c, "name"))
+	dt, err := s.State.store.GetDocType(c.Context(), acc.org, pathParam(c, "name"))
 	if err != nil {
 		return mapErr(err, "doctype not found")
 	}
 	return c.JSON(http.StatusOK, dt)
 }
 
-func (s *svc) replaceDocType(c *zip.Ctx) error {
-	acc, err := s.managerOnly(c)
+func replaceDocType(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, err := managerOnly(s, c)
 	if err != nil {
 		return err
 	}
@@ -160,19 +161,19 @@ func (s *svc) replaceDocType(c *zip.Ctx) error {
 	if err := dt.Validate(); err != nil {
 		return zip.ErrBadRequest(err.Error())
 	}
-	saved, err := s.store.ReplaceDocType(c.Context(), acc.org, dt)
+	saved, err := s.State.store.ReplaceDocType(c.Context(), acc.org, dt)
 	if err != nil {
 		return mapErr(err, "doctype not found")
 	}
 	return c.JSON(http.StatusOK, saved)
 }
 
-func (s *svc) deleteDocType(c *zip.Ctx) error {
-	acc, err := s.managerOnly(c)
+func deleteDocType(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, err := managerOnly(s, c)
 	if err != nil {
 		return err
 	}
-	deleted, err := s.store.DeleteDocType(c.Context(), acc.org, pathParam(c, "name"))
+	deleted, err := s.State.store.DeleteDocType(c.Context(), acc.org, pathParam(c, "name"))
 	if err != nil {
 		return zip.Errorf(http.StatusInternalServerError, "delete doctype: %v", err)
 	}
@@ -184,20 +185,20 @@ func (s *svc) deleteDocType(c *zip.Ctx) error {
 
 // ---- Role handlers ----
 
-func (s *svc) listRoles(c *zip.Ctx) error {
-	acc, err := s.resolveAccess(c)
+func listRoles(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, err := resolveAccess(s, c)
 	if err != nil {
 		return err
 	}
-	rows, err := s.store.ListRoles(c.Context(), acc.org)
+	rows, err := s.State.store.ListRoles(c.Context(), acc.org)
 	if err != nil {
 		return zip.Errorf(http.StatusInternalServerError, "list roles: %v", err)
 	}
 	return c.JSON(http.StatusOK, map[string]any{"data": rows})
 }
 
-func (s *svc) assignRole(c *zip.Ctx) error {
-	acc, err := s.managerOnly(c)
+func assignRole(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, err := managerOnly(s, c)
 	if err != nil {
 		return err
 	}
@@ -213,18 +214,18 @@ func (s *svc) assignRole(c *zip.Ctx) error {
 	if len(user) > maxNameLen || len(role) > maxNameLen {
 		return zip.ErrBadRequest("user or role too long")
 	}
-	if err := s.store.AssignRole(c.Context(), acc.org, user, role); err != nil {
+	if err := s.State.store.AssignRole(c.Context(), acc.org, user, role); err != nil {
 		return zip.Errorf(http.StatusInternalServerError, "assign role: %v", err)
 	}
 	return c.JSON(http.StatusCreated, Role{User: user, Role: role})
 }
 
-func (s *svc) revokeRole(c *zip.Ctx) error {
-	acc, err := s.managerOnly(c)
+func revokeRole(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, err := managerOnly(s, c)
 	if err != nil {
 		return err
 	}
-	revoked, err := s.store.RevokeRole(c.Context(), acc.org, pathParam(c, "user"), pathParam(c, "role"))
+	revoked, err := s.State.store.RevokeRole(c.Context(), acc.org, pathParam(c, "user"), pathParam(c, "role"))
 	if err != nil {
 		return zip.Errorf(http.StatusInternalServerError, "revoke role: %v", err)
 	}
@@ -239,8 +240,8 @@ func (s *svc) revokeRole(c *zip.Ctx) error {
 // listModules reports the app lanes registered in this binary and the DocType
 // names each installs. Any validated member may read the catalog (it is
 // compile-time first-party data, not tenant data); installing is gated separately.
-func (s *svc) listModules(c *zip.Ctx) error {
-	if _, err := s.resolveAccess(c); err != nil {
+func listModules(s *cloud.Service[state], c *zip.Ctx) error {
+	if _, err := resolveAccess(s, c); err != nil {
 		return err
 	}
 	mods := registeredModules()
@@ -253,8 +254,8 @@ func (s *svc) listModules(c *zip.Ctx) error {
 
 // getModule reports one lane's fixtures and which of them are already installed in
 // the caller's org — the honest install-state the UI shows ("set up" vs "installed").
-func (s *svc) getModule(c *zip.Ctx) error {
-	acc, err := s.resolveAccess(c)
+func getModule(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, err := resolveAccess(s, c)
 	if err != nil {
 		return err
 	}
@@ -265,7 +266,7 @@ func (s *svc) getModule(c *zip.Ctx) error {
 	}
 	installed := make([]string, 0, len(fx))
 	for _, dt := range fx {
-		if _, err := s.store.GetDocType(c.Context(), acc.org, dt.Name); err == nil {
+		if _, err := s.State.store.GetDocType(c.Context(), acc.org, dt.Name); err == nil {
 			installed = append(installed, dt.Name)
 		} else if !errors.Is(err, errNotFound) {
 			return mapErr(err, "")
@@ -280,8 +281,8 @@ func (s *svc) getModule(c *zip.Ctx) error {
 // trust-on-first-use) installs a lane into their OWN tenant and no one else's. The
 // module name is stamped onto each fixture so the lane's DocTypes are discoverable
 // by `module`.
-func (s *svc) installModule(c *zip.Ctx) error {
-	acc, err := s.managerOnly(c)
+func installModule(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, err := managerOnly(s, c)
 	if err != nil {
 		return err
 	}
@@ -293,7 +294,7 @@ func (s *svc) installModule(c *zip.Ctx) error {
 	created := make([]string, 0, len(fx))
 	existing := make([]string, 0, len(fx))
 	for _, dt := range fx {
-		if _, err := s.store.GetDocType(c.Context(), acc.org, dt.Name); err == nil {
+		if _, err := s.State.store.GetDocType(c.Context(), acc.org, dt.Name); err == nil {
 			existing = append(existing, dt.Name)
 			continue
 		} else if !errors.Is(err, errNotFound) {
@@ -303,7 +304,7 @@ func (s *svc) installModule(c *zip.Ctx) error {
 		if err := dt.Validate(); err != nil {
 			return zip.Errorf(http.StatusInternalServerError, "fixture %q invalid: %v", dt.Name, err)
 		}
-		if _, err := s.store.CreateDocType(c.Context(), acc.org, dt); err != nil {
+		if _, err := s.State.store.CreateDocType(c.Context(), acc.org, dt); err != nil {
 			if errors.Is(err, errConflict) { // lost a race with a concurrent install
 				existing = append(existing, dt.Name)
 				continue
@@ -326,8 +327,8 @@ func fixtureNames(fx []DocType) []string {
 
 // ---- Document handlers ----
 
-func (s *svc) createDocument(c *zip.Ctx) error {
-	acc, dt, err := s.access(c, rightCreate)
+func createDocument(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, dt, err := accessDoc(s, c, rightCreate)
 	if err != nil {
 		return err
 	}
@@ -338,35 +339,35 @@ func (s *svc) createDocument(c *zip.Ctx) error {
 	// A Single has exactly one document; create and update are the SAME upsert,
 	// guarded identically (draft-only). Route both through writeSingle.
 	if dt.IsSingle {
-		return s.writeSingle(c, acc, &dt, in, http.StatusCreated)
+		return writeSingle(s, c, acc, &dt, in, http.StatusCreated)
 	}
-	validated, err := s.store.validateDoc(c.Context(), acc.org, &dt, in, nil, "", false)
+	validated, err := s.State.store.validateDoc(c.Context(), acc.org, &dt, in, nil, "", false)
 	if err != nil {
 		return mapErr(err, "")
 	}
 	doc := Document{DocType: dt.Name, Data: validated}
-	ev := s.event(acc.org, &dt, &doc, nil)
+	ev := event(s, acc.org, &dt, &doc, nil)
 	if err := runHooks(c.Context(), ActionBeforeInsert, ev); err != nil {
 		return hookErr(err)
 	}
 	if err := runHooks(c.Context(), ActionBeforeSave, ev); err != nil {
 		return hookErr(err)
 	}
-	saved, err := s.store.CreateDocument(c.Context(), acc.org, &dt, doc.Data, stringField(in, "name"))
+	saved, err := s.State.store.CreateDocument(c.Context(), acc.org, &dt, doc.Data, stringField(in, "name"))
 	if err != nil {
 		return mapErr(err, "")
 	}
-	s.after(c.Context(), acc.org, &dt, &saved, nil)
+	after(s, c.Context(), acc.org, &dt, &saved, nil)
 	return c.JSON(http.StatusCreated, wireDoc(&dt, saved, nil))
 }
 
-func (s *svc) listDocuments(c *zip.Ctx) error {
-	acc, dt, err := s.access(c, rightRead)
+func listDocuments(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, dt, err := accessDoc(s, c, rightRead)
 	if err != nil {
 		return err
 	}
 	if dt.IsSingle {
-		doc, err := s.getSingle(c.Context(), acc.org, &dt)
+		doc, err := getSingle(s, c.Context(), acc.org, &dt)
 		if err != nil {
 			return mapErr(err, "not found")
 		}
@@ -376,7 +377,7 @@ func (s *svc) listDocuments(c *zip.Ctx) error {
 	if err != nil {
 		return err
 	}
-	rows, err := s.store.ListDocuments(c.Context(), acc.org, dt.Name, opts)
+	rows, err := s.State.store.ListDocuments(c.Context(), acc.org, dt.Name, opts)
 	if err != nil {
 		return zip.Errorf(http.StatusInternalServerError, "list: %v", err)
 	}
@@ -387,28 +388,28 @@ func (s *svc) listDocuments(c *zip.Ctx) error {
 	return c.JSON(http.StatusOK, map[string]any{"data": out})
 }
 
-func (s *svc) getDocument(c *zip.Ctx) error {
-	acc, dt, err := s.access(c, rightRead)
+func getDocument(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, dt, err := accessDoc(s, c, rightRead)
 	if err != nil {
 		return err
 	}
-	name := s.docName(c, &dt)
+	name := docName(s, c, &dt)
 	if dt.IsSingle {
-		doc, err := s.getSingle(c.Context(), acc.org, &dt)
+		doc, err := getSingle(s, c.Context(), acc.org, &dt)
 		if err != nil {
 			return mapErr(err, "document not found")
 		}
 		return c.JSON(http.StatusOK, wireDoc(&dt, doc, nil))
 	}
-	doc, err := s.store.GetDocument(c.Context(), acc.org, dt.Name, name)
+	doc, err := s.State.store.GetDocument(c.Context(), acc.org, dt.Name, name)
 	if err != nil {
 		return mapErr(err, "document not found")
 	}
 	return c.JSON(http.StatusOK, wireDoc(&dt, doc, nil))
 }
 
-func (s *svc) updateDocument(c *zip.Ctx) error {
-	acc, dt, err := s.access(c, rightWrite)
+func updateDocument(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, dt, err := accessDoc(s, c, rightWrite)
 	if err != nil {
 		return err
 	}
@@ -417,52 +418,52 @@ func (s *svc) updateDocument(c *zip.Ctx) error {
 		return err
 	}
 	if dt.IsSingle {
-		return s.writeSingle(c, acc, &dt, in, http.StatusOK)
+		return writeSingle(s, c, acc, &dt, in, http.StatusOK)
 	}
-	name := s.docName(c, &dt)
+	name := docName(s, c, &dt)
 
-	prev, err := s.store.GetDocument(c.Context(), acc.org, dt.Name, name)
+	prev, err := s.State.store.GetDocument(c.Context(), acc.org, dt.Name, name)
 	if err != nil {
 		return mapErr(err, "document not found")
 	}
 	if prev.DocStatus != 0 {
 		return zip.Errorf(http.StatusConflict, "document is not a draft (docstatus %d); cannot edit", prev.DocStatus)
 	}
-	validated, err := s.store.validateDoc(c.Context(), acc.org, &dt, in, prev.Data, name, false)
+	validated, err := s.State.store.validateDoc(c.Context(), acc.org, &dt, in, prev.Data, name, false)
 	if err != nil {
 		return mapErr(err, "")
 	}
 	doc := Document{DocType: dt.Name, Name: name, Data: validated, DocStatus: prev.DocStatus}
-	ev := s.event(acc.org, &dt, &doc, &prev)
+	ev := event(s, acc.org, &dt, &doc, &prev)
 	if err := runHooks(c.Context(), ActionBeforeSave, ev); err != nil {
 		return hookErr(err)
 	}
-	saved, err := s.store.UpdateDocument(c.Context(), acc.org, &dt, name, doc.Data)
+	saved, err := s.State.store.UpdateDocument(c.Context(), acc.org, &dt, name, doc.Data)
 	if err != nil {
 		return mapErr(err, "document not found")
 	}
-	s.after(c.Context(), acc.org, &dt, &saved, &prev)
+	after(s, c.Context(), acc.org, &dt, &saved, &prev)
 	return c.JSON(http.StatusOK, wireDoc(&dt, saved, nil))
 }
 
-func (s *svc) deleteDocument(c *zip.Ctx) error {
-	acc, dt, err := s.access(c, rightDelete)
+func deleteDocument(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, dt, err := accessDoc(s, c, rightDelete)
 	if err != nil {
 		return err
 	}
-	name := s.docName(c, &dt)
-	prev, err := s.store.GetDocument(c.Context(), acc.org, dt.Name, name)
+	name := docName(s, c, &dt)
+	prev, err := s.State.store.GetDocument(c.Context(), acc.org, dt.Name, name)
 	if err != nil {
 		return mapErr(err, "document not found")
 	}
 	if prev.DocStatus == 1 {
 		return zip.Errorf(http.StatusConflict, "submitted document must be cancelled before deletion")
 	}
-	ev := s.event(acc.org, &dt, &prev, nil)
+	ev := event(s, acc.org, &dt, &prev, nil)
 	if err := runHooks(c.Context(), ActionOnTrash, ev); err != nil {
 		return hookErr(err)
 	}
-	deleted, err := s.store.DeleteDocument(c.Context(), acc.org, dt.Name, name)
+	deleted, err := s.State.store.DeleteDocument(c.Context(), acc.org, dt.Name, name)
 	if err != nil {
 		return zip.Errorf(http.StatusInternalServerError, "delete: %v", err)
 	}
@@ -472,55 +473,55 @@ func (s *svc) deleteDocument(c *zip.Ctx) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-func (s *svc) submitDocument(c *zip.Ctx) error {
-	return s.transition(c, rightSubmit, 0, 1, ActionOnSubmit)
+func submitDocument(s *cloud.Service[state], c *zip.Ctx) error {
+	return transition(s, c, rightSubmit, 0, 1, ActionOnSubmit)
 }
 
-func (s *svc) cancelDocument(c *zip.Ctx) error {
-	return s.transition(c, rightCancel, 1, 2, ActionOnCancel)
+func cancelDocument(s *cloud.Service[state], c *zip.Ctx) error {
+	return transition(s, c, rightCancel, 1, 2, ActionOnCancel)
 }
 
 // transition is the shared submit/cancel path: gate on the right, require the
 // doctype be submittable, run the lifecycle hook (gate), then flip docstatus.
-func (s *svc) transition(c *zip.Ctx, right string, from, to int, action string) error {
-	acc, dt, err := s.access(c, right)
+func transition(s *cloud.Service[state], c *zip.Ctx, right string, from, to int, action string) error {
+	acc, dt, err := accessDoc(s, c, right)
 	if err != nil {
 		return err
 	}
 	if !dt.IsSubmittable {
 		return zip.ErrBadRequest("doctype is not submittable")
 	}
-	name := s.docName(c, &dt)
-	doc, err := s.store.GetDocument(c.Context(), acc.org, dt.Name, name)
+	name := docName(s, c, &dt)
+	doc, err := s.State.store.GetDocument(c.Context(), acc.org, dt.Name, name)
 	if err != nil {
 		return mapErr(err, "document not found")
 	}
 	if doc.DocStatus != from {
 		return zip.Errorf(http.StatusConflict, "illegal docstatus transition from %d", doc.DocStatus)
 	}
-	ev := s.event(acc.org, &dt, &doc, nil)
+	ev := event(s, acc.org, &dt, &doc, nil)
 	if err := runHooks(c.Context(), action, ev); err != nil {
 		return hookErr(err)
 	}
-	saved, err := s.store.SetDocStatus(c.Context(), acc.org, dt.Name, name, from, to)
+	saved, err := s.State.store.SetDocStatus(c.Context(), acc.org, dt.Name, name, from, to)
 	if err != nil {
 		return mapErr(err, "document not found")
 	}
 	return c.JSON(http.StatusOK, wireDoc(&dt, saved, nil))
 }
 
-func (s *svc) summary(c *zip.Ctx) error {
-	acc, err := s.resolveAccess(c)
+func summary(s *cloud.Service[state], c *zip.Ctx) error {
+	acc, err := resolveAccess(s, c)
 	if err != nil {
 		return err
 	}
-	dts, err := s.store.ListDocTypes(c.Context(), acc.org)
+	dts, err := s.State.store.ListDocTypes(c.Context(), acc.org)
 	if err != nil {
 		return zip.Errorf(http.StatusInternalServerError, "summary: %v", err)
 	}
 	var docs int
 	for _, dt := range dts {
-		n, err := s.store.CountDocuments(c.Context(), acc.org, dt.Name)
+		n, err := s.State.store.CountDocuments(c.Context(), acc.org, dt.Name)
 		if err != nil {
 			return zip.Errorf(http.StatusInternalServerError, "summary: %v", err)
 		}
@@ -534,12 +535,12 @@ func (s *svc) summary(c *zip.Ctx) error {
 // access resolves the caller AND loads the target DocType, enforcing `right` in
 // one place. It is the ONE gate every document handler passes through: 403 on no
 // principal or denied permission, 404 on unknown doctype.
-func (s *svc) access(c *zip.Ctx, right string) (access, DocType, error) {
-	acc, err := s.resolveAccess(c)
+func accessDoc(s *cloud.Service[state], c *zip.Ctx, right string) (access, DocType, error) {
+	acc, err := resolveAccess(s, c)
 	if err != nil {
 		return access{}, DocType{}, err
 	}
-	dt, err := s.store.GetDocType(c.Context(), acc.org, pathParam(c, "doctype"))
+	dt, err := s.State.store.GetDocType(c.Context(), acc.org, pathParam(c, "doctype"))
 	if err != nil {
 		return access{}, DocType{}, mapErr(err, "doctype not found")
 	}
@@ -549,22 +550,22 @@ func (s *svc) access(c *zip.Ctx, right string) (access, DocType, error) {
 	return acc, dt, nil
 }
 
-func (s *svc) event(org string, dt *DocType, doc, prev *Document) *Event {
-	return &Event{Org: org, DocType: dt.Name, Doc: doc, Prev: prev, Meta: dt, Store: s.store, Logger: s.log}
+func event(s *cloud.Service[state], org string, dt *DocType, doc, prev *Document) *Event {
+	return &Event{Org: org, DocType: dt.Name, Doc: doc, Prev: prev, Meta: dt, Store: s.State.store, Logger: s.Log}
 }
 
 // after runs after_save hooks; a failure is logged, not fatal (the write already
 // committed — gates belong in before_save/on_submit, see hook.go).
-func (s *svc) after(ctx context.Context, org string, dt *DocType, doc, prev *Document) {
-	ev := s.event(org, dt, doc, prev)
+func after(s *cloud.Service[state], ctx context.Context, org string, dt *DocType, doc, prev *Document) {
+	ev := event(s, org, dt, doc, prev)
 	if err := runHooks(ctx, ActionAfterSave, ev); err != nil {
-		s.log.Warn("after_save hook failed", "doctype", dt.Name, "name", doc.Name, "err", err)
+		s.Log.Warn("after_save hook failed", "doctype", dt.Name, "name", doc.Name, "err", err)
 	}
 }
 
 // docName returns the effective document name: the URL param, or the doctype name
 // for a Single (a single always has exactly one document named after its type).
-func (s *svc) docName(c *zip.Ctx, dt *DocType) string {
+func docName(s *cloud.Service[state], c *zip.Ctx, dt *DocType) string {
 	if dt.IsSingle {
 		return dt.Name
 	}
@@ -591,8 +592,8 @@ func pathParam(c *zip.Ctx, name string) string {
 
 // getSingle returns the Single's document, or a virtual empty draft when it has
 // not been written yet (a single always "exists").
-func (s *svc) getSingle(ctx context.Context, org string, dt *DocType) (Document, error) {
-	doc, err := s.store.GetDocument(ctx, org, dt.Name, dt.Name)
+func getSingle(s *cloud.Service[state], ctx context.Context, org string, dt *DocType) (Document, error) {
+	doc, err := s.State.store.GetDocument(ctx, org, dt.Name, dt.Name)
 	if err == errNotFound {
 		return Document{Name: dt.Name, DocType: dt.Name, Data: map[string]any{}}, nil
 	}
@@ -605,8 +606,8 @@ func (s *svc) getSingle(ctx context.Context, org string, dt *DocType) (Document,
 // (409) — and preserves a redacted Password across an unchanged update by passing
 // the current data as `prev` to the validator. Without this guard UpsertSingle
 // would silently mutate a submitted Single (the LOW-1 finding).
-func (s *svc) writeSingle(c *zip.Ctx, acc access, dt *DocType, in map[string]any, okStatus int) error {
-	cur, curErr := s.store.GetDocument(c.Context(), acc.org, dt.Name, dt.Name)
+func writeSingle(s *cloud.Service[state], c *zip.Ctx, acc access, dt *DocType, in map[string]any, okStatus int) error {
+	cur, curErr := s.State.store.GetDocument(c.Context(), acc.org, dt.Name, dt.Name)
 	var prev map[string]any
 	if curErr == nil {
 		if cur.DocStatus != 0 {
@@ -616,20 +617,20 @@ func (s *svc) writeSingle(c *zip.Ctx, acc access, dt *DocType, in map[string]any
 	} else if curErr != errNotFound {
 		return mapErr(curErr, "")
 	}
-	validated, err := s.store.validateDoc(c.Context(), acc.org, dt, in, prev, dt.Name, false)
+	validated, err := s.State.store.validateDoc(c.Context(), acc.org, dt, in, prev, dt.Name, false)
 	if err != nil {
 		return mapErr(err, "")
 	}
 	doc := Document{DocType: dt.Name, Name: dt.Name, Data: validated}
-	ev := s.event(acc.org, dt, &doc, nil)
+	ev := event(s, acc.org, dt, &doc, nil)
 	if err := runHooks(c.Context(), ActionBeforeSave, ev); err != nil {
 		return hookErr(err)
 	}
-	saved, err := s.store.UpsertSingle(c.Context(), acc.org, dt, doc.Data)
+	saved, err := s.State.store.UpsertSingle(c.Context(), acc.org, dt, doc.Data)
 	if err != nil {
 		return mapErr(err, "")
 	}
-	s.after(c.Context(), acc.org, dt, &saved, nil)
+	after(s, c.Context(), acc.org, dt, &saved, nil)
 	return c.JSON(okStatus, wireDoc(dt, saved, nil))
 }
 

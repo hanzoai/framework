@@ -40,14 +40,14 @@ type Ingested struct {
 // them on its connection status.
 func Ingest(ctx context.Context, org, doctype string, data map[string]any, requestedName string) (Ingested, error) {
 	s := mounted
-	if s == nil || s.store == nil {
+	if s == nil || s.State.store == nil {
 		return Ingested{}, fmt.Errorf("framework: not mounted")
 	}
 	if org == "" {
 		return Ingested{}, fmt.Errorf("framework.Ingest: empty org")
 	}
 
-	dt, err := s.store.GetDocType(ctx, org, doctype)
+	dt, err := s.State.store.GetDocType(ctx, org, doctype)
 	if err != nil {
 		return Ingested{}, fmt.Errorf("framework.Ingest: doctype %q: %w", doctype, err)
 	}
@@ -59,24 +59,24 @@ func Ingest(ctx context.Context, org, doctype string, data map[string]any, reque
 		return Ingested{}, fmt.Errorf("framework.Ingest: %q is a Single doctype", doctype)
 	}
 
-	validated, err := s.store.validateDoc(ctx, org, &dt, data, nil, "", false)
+	validated, err := s.State.store.validateDoc(ctx, org, &dt, data, nil, "", false)
 	if err != nil {
 		return Ingested{}, err
 	}
 	doc := Document{DocType: dt.Name, Data: validated}
-	ev := s.event(org, &dt, &doc, nil)
+	ev := event(s, org, &dt, &doc, nil)
 	if err := runHooks(ctx, ActionBeforeInsert, ev); err != nil {
 		return Ingested{}, err
 	}
 	if err := runHooks(ctx, ActionBeforeSave, ev); err != nil {
 		return Ingested{}, err
 	}
-	saved, err := s.store.CreateDocument(ctx, org, &dt, doc.Data, requestedName)
+	saved, err := s.State.store.CreateDocument(ctx, org, &dt, doc.Data, requestedName)
 	if err != nil {
 		return Ingested{}, err
 	}
 	// after_save runs the indexing hook (non-fatal, logged) exactly as on the HTTP path.
-	s.after(ctx, org, &dt, &saved, nil)
+	after(s, ctx, org, &dt, &saved, nil)
 	return Ingested{Org: org, DocType: dt.Name, Name: saved.Name}, nil
 }
 
@@ -85,10 +85,10 @@ func Ingest(ctx context.Context, org, doctype string, data map[string]any, reque
 // "install the kb module first" rather than a doctype-not-found error mid-sync.
 func Installed(ctx context.Context, org, doctype string) bool {
 	s := mounted
-	if s == nil || s.store == nil {
+	if s == nil || s.State.store == nil {
 		return false
 	}
-	_, err := s.store.GetDocType(ctx, org, doctype)
+	_, err := s.State.store.GetDocType(ctx, org, doctype)
 	return err == nil
 }
 
@@ -99,31 +99,31 @@ func Installed(ctx context.Context, org, doctype string) bool {
 // engine-assigned document name from a prior Ingest.
 func UpdateData(ctx context.Context, org, doctype, name string, data map[string]any) error {
 	s := mounted
-	if s == nil || s.store == nil {
+	if s == nil || s.State.store == nil {
 		return fmt.Errorf("framework: not mounted")
 	}
-	dt, err := s.store.GetDocType(ctx, org, doctype)
+	dt, err := s.State.store.GetDocType(ctx, org, doctype)
 	if err != nil {
 		return fmt.Errorf("framework.UpdateData: doctype %q: %w", doctype, err)
 	}
-	prev, err := s.store.GetDocument(ctx, org, doctype, name)
+	prev, err := s.State.store.GetDocument(ctx, org, doctype, name)
 	if err != nil {
 		return err
 	}
-	validated, err := s.store.validateDoc(ctx, org, &dt, data, prev.Data, name, false)
+	validated, err := s.State.store.validateDoc(ctx, org, &dt, data, prev.Data, name, false)
 	if err != nil {
 		return err
 	}
 	doc := Document{Name: name, DocType: dt.Name, Data: validated}
-	ev := s.event(org, &dt, &doc, &prev)
+	ev := event(s, org, &dt, &doc, &prev)
 	if err := runHooks(ctx, ActionBeforeSave, ev); err != nil {
 		return err
 	}
-	saved, err := s.store.UpdateDocument(ctx, org, &dt, name, doc.Data)
+	saved, err := s.State.store.UpdateDocument(ctx, org, &dt, name, doc.Data)
 	if err != nil {
 		return err
 	}
-	s.after(ctx, org, &dt, &saved, &prev)
+	after(s, ctx, org, &dt, &saved, &prev)
 	return nil
 }
 
@@ -133,10 +133,10 @@ func UpdateData(ctx context.Context, org, doctype, name string, data map[string]
 // `field` is validated against the doctype schema by ListDocuments' bound json path.
 func FindByField(ctx context.Context, org, doctype, field, value string) (string, error) {
 	s := mounted
-	if s == nil || s.store == nil {
+	if s == nil || s.State.store == nil {
 		return "", fmt.Errorf("framework: not mounted")
 	}
-	docs, err := s.store.ListDocuments(ctx, org, doctype, ListOpts{
+	docs, err := s.State.store.ListDocuments(ctx, org, doctype, ListOpts{
 		Filters: map[string]string{field: value},
 		Limit:   1,
 	})
@@ -155,8 +155,8 @@ func FindByField(ctx context.Context, org, doctype, field, value string) (string
 // ListDocuments — every result is physically scoped to `org`.
 func Search(ctx context.Context, org, doctype string, filters map[string]string, limit int) ([]Document, error) {
 	s := mounted
-	if s == nil || s.store == nil {
+	if s == nil || s.State.store == nil {
 		return nil, fmt.Errorf("framework: not mounted")
 	}
-	return s.store.ListDocuments(ctx, org, doctype, ListOpts{Filters: filters, Limit: limit})
+	return s.State.store.ListDocuments(ctx, org, doctype, ListOpts{Filters: filters, Limit: limit})
 }
