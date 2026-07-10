@@ -15,7 +15,7 @@ import (
 // path and no way for a document created off-request to skip validation or the
 // lifecycle hooks. The ONLY difference from the HTTP path is the permission gate:
 // there is no request principal, so the caller supplies the already-VALIDATED org
-// (its own tenant, resolved once upstream via principal.Tenant) and vouches, as
+// (its own tenant, resolved once upstream via principal.Org) and vouches, as
 // first-party Go, that the write belongs to that tenant. Every store operation is
 // still physically scoped by that org, so a connector can only ever write into the
 // org it is syncing.
