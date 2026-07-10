@@ -14,7 +14,7 @@ import (
 	// mattn+SQLCipher, encrypted at rest; !cgo → pure-Go modernc). Importing
 	// modernc directly instead would double-register "sqlite" under CGO and
 	// panic at init. Blank import registers the driver.
-	"github.com/hanzoai/cloud/internal/cek"
+	"github.com/hanzoai/cloud/cek"
 	_ "github.com/hanzoai/sqlite"
 )
 
