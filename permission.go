@@ -13,7 +13,7 @@ import (
 // fw_roles table maps (org, user) → roles, managed at /v1/framework/roles.
 //
 // The gate. Every handler resolves an `access` through ONE seam (resolveAccess),
-// which begins with the ONE tenant derivation (principal.Tenant) and never a
+// which begins with the ONE tenant derivation (principal.Org) and never a
 // second path. From the validated principal it derives the caller's effective
 // roles and whether they are a manager, then answers can(doctype, right).
 const (
@@ -49,7 +49,7 @@ type access struct {
 // second org-derivation path in this package. It reads the caller's per-org roles
 // and computes manager status (global admin OR System Manager OR bootstrap).
 func (s *svc) resolveAccess(c *zip.Ctx) (access, error) {
-	org, ok := principal.Tenant(c)
+	org, ok := principal.Org(c)
 	if !ok {
 		return access{}, zip.ErrForbidden("valid principal required")
 	}
@@ -132,7 +132,7 @@ func permGrants(p DocPerm, right string) bool {
 // persisted, ONCE — i.e. the org owner/creator. Every later member has NO
 // privilege until the owner grants a role. This is strictly narrower than the
 // previous "any member is a manager until a role exists" and can NEVER cross a
-// tenant (org is the validated tenant, principal.Tenant). It resolves the setup
+// tenant (org is the validated tenant, principal.Org). It resolves the setup
 // chicken-and-egg (an org with no roles could otherwise never define its first
 // DocType) without a footgun.
 //
