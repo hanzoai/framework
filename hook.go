@@ -58,7 +58,7 @@ const (
 type Event struct {
 	// Action is one of the Action* constants.
 	Action string
-	// Org is the VALIDATED tenant (clients/principal.Tenant). A hook that touches
+	// Org is the VALIDATED tenant (clients/principal.Org). A hook that touches
 	// sibling data MUST scope every query by it.
 	Org string
 	// DocType is the document's DocType name.
