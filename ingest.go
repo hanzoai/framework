@@ -2,6 +2,7 @@ package framework
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -159,4 +160,35 @@ func Search(ctx context.Context, org, doctype string, filters map[string]string,
 		return nil, fmt.Errorf("framework: not mounted")
 	}
 	return s.State.store.ListDocuments(ctx, org, doctype, ListOpts{Filters: filters, Limit: limit})
+}
+
+// Get returns a single document by name in (org, doctype) — the read-one twin of
+// Search for a first-party in-process reader (the content lane reads the current
+// document to compute a lifecycle transition). `org` MUST be a validated tenant the
+// caller already resolved. It returns ErrNotFound when the document does not exist, so
+// the caller can answer 404 rather than 500.
+func Get(ctx context.Context, org, doctype, name string) (Document, error) {
+	s := mounted
+	if s == nil || s.State.store == nil {
+		return Document{}, fmt.Errorf("framework: not mounted")
+	}
+	return s.State.store.GetDocument(ctx, org, doctype, name)
+}
+
+// Exported error sentinels let an in-process caller (e.g. the content lane) classify
+// the errors Ingest/Get/UpdateData/Search return WITHOUT string-matching. They alias
+// the package's internal sentinels — the ONE definition stays in store.go, these are
+// just the public handles.
+var (
+	ErrNotFound = errNotFound
+	ErrConflict = errConflict
+	ErrBadRef   = errBadRef
+)
+
+// IsValidationError reports whether err is a document-schema violation (the 400-class
+// error validateDoc returns), so an in-process caller maps it to Bad Request rather
+// than a 500 — the same *validationError the HTTP layer maps via mapErr.
+func IsValidationError(err error) bool {
+	var ve *validationError
+	return errors.As(err, &ve)
 }
