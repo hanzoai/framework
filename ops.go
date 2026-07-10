@@ -86,13 +86,6 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 	return nil
 }
 
-func init() {
-	cloud.RegisterWithShutdown("framework", 129,
-		cloud.Typed(Mount),
-		func(ctx context.Context) error { return Shutdown() },
-	)
-}
-
 // Shutdown closes the framework store. Idempotent.
 func Shutdown() error {
 	if mounted == nil || mounted.State.store == nil {
