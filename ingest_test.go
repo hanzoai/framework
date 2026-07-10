@@ -16,7 +16,7 @@ import (
 // mountForIngest mounts the framework (setting the package-global `mounted`) and
 // seeds a doctype in an org via the HTTP install-less direct path (CreateDocType on
 // the mounted store) so Ingest has a schema to write against.
-func mountForIngest(t *testing.T) (*svc, func()) {
+func mountForIngest(t *testing.T) (*cloud.Service[state], func()) {
 	t.Helper()
 	app := zip.New(zip.Config{Logger: luxlog.New("test")})
 	if err := Mount(app, cloud.Deps{Logger: luxlog.New("test"), DataDir: t.TempDir()}); err != nil {
@@ -38,7 +38,7 @@ func TestIngestValidatesAndFiresHooks(t *testing.T) {
 		},
 		Perms: []DocPerm{{Role: RoleSystemManager, Read: true, Write: true, Create: true, Delete: true}},
 	}
-	if _, err := s.store.CreateDocType(context.Background(), "acme", dt); err != nil {
+	if _, err := s.State.store.CreateDocType(context.Background(), "acme", dt); err != nil {
 		t.Fatalf("seed doctype: %v", err)
 	}
 
@@ -69,7 +69,7 @@ func TestIngestValidatesAndFiresHooks(t *testing.T) {
 	}
 
 	// The document must be persisted and readable in-org.
-	doc, err := s.store.GetDocument(context.Background(), "acme", "note", ing.Name)
+	doc, err := s.State.store.GetDocument(context.Background(), "acme", "note", ing.Name)
 	if err != nil {
 		t.Fatalf("GetDocument: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestIngestValidatesAndFiresHooks(t *testing.T) {
 	}
 
 	// Isolation: the doc must NOT be visible in another org.
-	if _, err := s.store.GetDocument(context.Background(), "other", "note", ing.Name); err == nil {
+	if _, err := s.State.store.GetDocument(context.Background(), "other", "note", ing.Name); err == nil {
 		t.Error("ingested doc leaked into another org")
 	}
 }
@@ -91,7 +91,7 @@ func TestIngestRejectsMissingRequired(t *testing.T) {
 		Fields: []DocField{{Fieldname: "title", Fieldtype: FieldData, Reqd: true}},
 		Perms:  []DocPerm{{Role: RoleSystemManager, Read: true, Create: true}},
 	}
-	if _, err := s.store.CreateDocType(context.Background(), "acme", dt); err != nil {
+	if _, err := s.State.store.CreateDocType(context.Background(), "acme", dt); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	// Missing the required `title` → validation error (same gate as HTTP create).

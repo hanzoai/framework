@@ -1,6 +1,7 @@
 package framework
 
 import (
+	"github.com/hanzoai/cloud"
 	"github.com/hanzoai/cloud/clients/principal"
 	"github.com/zap-proto/zip"
 )
@@ -48,7 +49,7 @@ type access struct {
 // validated principal of a real org, or a 403 error otherwise — there is no
 // second org-derivation path in this package. It reads the caller's per-org roles
 // and computes manager status (global admin OR System Manager OR bootstrap).
-func (s *svc) resolveAccess(c *zip.Ctx) (access, error) {
+func resolveAccess(s *cloud.Service[state], c *zip.Ctx) (access, error) {
 	org, ok := principal.Tenant(c)
 	if !ok {
 		return access{}, zip.ErrForbidden("valid principal required")
@@ -62,7 +63,7 @@ func (s *svc) resolveAccess(c *zip.Ctx) (access, error) {
 		return acc, nil
 	}
 
-	assigned, err := s.store.RolesFor(c.Context(), org, acc.user)
+	assigned, err := s.State.store.RolesFor(c.Context(), org, acc.user)
 	if err != nil {
 		return access{}, zip.Errorf(500, "resolve roles: %v", err)
 	}
@@ -141,15 +142,15 @@ func permGrants(p DocPerm, right string) bool {
 // simultaneous first-callers each seed themselves (Red measured 3–6). If our
 // insert did not win, we re-resolve — another request may have granted this user a
 // role in the race — and refuse only if still non-manager.
-func (s *svc) managerOnly(c *zip.Ctx) (access, error) {
-	acc, err := s.resolveAccess(c)
+func managerOnly(s *cloud.Service[state], c *zip.Ctx) (access, error) {
+	acc, err := resolveAccess(s, c)
 	if err != nil {
 		return access{}, err
 	}
 	if acc.manager {
 		return acc, nil
 	}
-	seeded, err := s.store.SeedOwnerIfUnowned(c.Context(), acc.org, acc.user)
+	seeded, err := s.State.store.SeedOwnerIfUnowned(c.Context(), acc.org, acc.user)
 	if err != nil {
 		return access{}, zip.Errorf(500, "seed owner: %v", err)
 	}
@@ -160,7 +161,7 @@ func (s *svc) managerOnly(c *zip.Ctx) (access, error) {
 	}
 	// Our seed did not win (the org is now owned). Re-resolve: a concurrent grant
 	// may have made this caller a manager; otherwise refuse.
-	assigned, err := s.store.RolesFor(c.Context(), acc.org, acc.user)
+	assigned, err := s.State.store.RolesFor(c.Context(), acc.org, acc.user)
 	if err != nil {
 		return access{}, zip.Errorf(500, "resolve roles: %v", err)
 	}
