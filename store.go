@@ -60,7 +60,7 @@ func openStore(path string) (*Store, error) {
 	return s, nil
 }
 
-// migrate creates the four framework tables. Idempotent (IF NOT EXISTS). Every
+// migrate creates the five framework tables. Idempotent (IF NOT EXISTS). Every
 // table leads its primary key with `org` so tenant isolation is a physical
 // property of the schema, not merely a WHERE clause.
 func (s *Store) migrate() error {
@@ -107,6 +107,14 @@ CREATE TABLE IF NOT EXISTS fw_roles (
   PRIMARY KEY (org, usr, role)
 );
 CREATE INDEX IF NOT EXISTS ix_fw_roles_org ON fw_roles(org);
+
+CREATE TABLE IF NOT EXISTS fw_locks (
+  org        TEXT NOT NULL,
+  lockkey    TEXT NOT NULL,
+  holder     TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,   -- unix nanos; a lease auto-expires so a crashed holder never wedges
+  PRIMARY KEY (org, lockkey)
+);
 `
 	if _, err := s.db.Exec(ddl); err != nil {
 		return fmt.Errorf("framework migrate: %w", err)
