@@ -122,6 +122,18 @@ func runHooks(ctx context.Context, action string, ev *Event) error {
 	return nil
 }
 
+// RegisteredHookCount returns the number of (doctype, action) keys carrying at
+// least one registered hook. Exported so the composition root's link-guard test
+// can assert an app lane's lifecycle hooks — notably erp's ledger-posting hooks —
+// are compiled into the binary. Hooks register from a package init() SEPARATELY
+// from module DocTypes; asserting the module alone would stay green if a future
+// refactor split registerHooks() into its own file whose blank import got dropped.
+func RegisteredHookCount() int {
+	hookMu.RLock()
+	defer hookMu.RUnlock()
+	return len(hookRegistry)
+}
+
 // resetHooks clears the registry. TEST-ONLY: keeps hook-behavior tests
 // independent of process-global registrations.
 func resetHooks() {
