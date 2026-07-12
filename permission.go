@@ -36,7 +36,7 @@ const (
 )
 
 // access is a resolved caller: their org (the validated tenant), effective role
-// set, user id, and whether they are a manager (global admin, an explicit System
+// set, user id, and whether they are a manager (SuperAdmin, an explicit System
 // Manager, or a member of an as-yet-unconfigured org — the bootstrap).
 type access struct {
 	org     string
@@ -48,7 +48,7 @@ type access struct {
 // resolveAccess is the ONE authorization seam. It returns (access, nil) for a
 // validated principal of a real org, or a 403 error otherwise — there is no
 // second org-derivation path in this package. It reads the caller's per-org roles
-// and computes manager status (global admin OR System Manager OR bootstrap).
+// and computes manager status (SuperAdmin OR System Manager OR bootstrap).
 func resolveAccess(s *cloud.Service[state], c *zip.Ctx) (access, error) {
 	org, ok := principal.Org(c)
 	if !ok {
@@ -56,7 +56,7 @@ func resolveAccess(s *cloud.Service[state], c *zip.Ctx) (access, error) {
 	}
 	acc := access{org: org, user: c.User(), roles: map[string]bool{RoleAll: true}}
 
-	// Global admin (validated owner == AdminOrg) is a manager everywhere.
+	// SuperAdmin (validated owner == AdminOrg) is a manager everywhere.
 	if c.IsAdmin() {
 		acc.manager = true
 		acc.roles[RoleSystemManager] = true
@@ -74,7 +74,7 @@ func resolveAccess(s *cloud.Service[state], c *zip.Ctx) (access, error) {
 		}
 	}
 	// No implicit manager here: a member's authority is EXACTLY their assigned
-	// roles (plus global admin above). The one-time owner seeding lives in
+	// roles (plus SuperAdmin above). The one-time owner seeding lives in
 	// managerOnly, so a role-less member is never silently a manager on the read /
 	// document-CRUD path — permless doctypes are default-closed (see can).
 	return acc, nil
@@ -82,7 +82,7 @@ func resolveAccess(s *cloud.Service[state], c *zip.Ctx) (access, error) {
 
 // can reports whether the caller may perform `right` on a document of dt.
 //
-//   - A manager (System Manager / global admin) may do anything.
+//   - A manager (System Manager / SuperAdmin) may do anything.
 //   - Otherwise, at least one of the caller's roles must carry `right` in the
 //     DocType's permission rows.
 //
