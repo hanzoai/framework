@@ -112,7 +112,7 @@ data (envelope keys always included). `order_by` is `"<field> asc|desc"`.
 
 DocType registry: `GET/POST /v1/framework/doctypes`,
 `GET/PUT/DELETE /v1/framework/doctypes/:name`. Defining/replacing/deleting a
-DocType requires the **System Manager** role (or global admin).
+DocType requires the **System Manager** role (or SuperAdmin).
 
 ## Permissions (per-org, DocType perms by role) — secure by default
 
@@ -120,7 +120,7 @@ The caller's role source is the framework's OWN per-org role store (IAM's JWT
 carries no roles into the cloud binary), managed at `/v1/framework/roles`
 (`GET`, `POST {user,role}`, `DELETE /:user/:role`). Enforcement:
 
-- **Global admin** (`c.IsAdmin()`, validated owner == AdminOrg) may do anything.
+- **SuperAdmin** (`c.IsAdmin()`, validated owner == AdminOrg) may do anything.
 - **Owner seeding (trust-on-first-use)**: the FIRST validated principal to
   administer an org that has no role assignments becomes its **System Manager**,
   persisted ONCE — the org owner/creator. Every later member has no privilege
