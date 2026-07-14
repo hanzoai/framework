@@ -107,3 +107,54 @@ func TestIngestUnknownDocTypeErrors(t *testing.T) {
 		t.Error("Ingest must error on an unknown doctype")
 	}
 }
+
+// TestDeleteRunsTrashHookAndRemoves proves the in-process Delete (used by KB edge
+// reconciliation) runs the on_trash gate and removes the row, and that a gate error
+// aborts the delete — the SAME contract as the HTTP delete path.
+func TestDeleteRunsTrashHookAndRemoves(t *testing.T) {
+	s, done := mountForIngest(t)
+	defer done()
+	dt := DocType{
+		Name: "note", Module: "test",
+		Fields: []DocField{{Fieldname: "title", Fieldtype: FieldData, Reqd: true}},
+		Perms:  []DocPerm{{Role: RoleSystemManager, Read: true, Write: true, Create: true, Delete: true}},
+	}
+	if _, err := s.State.store.CreateDocType(context.Background(), "acme", dt); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	ing, err := Ingest(context.Background(), "acme", "note", map[string]any{"title": "x"}, "")
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	// on_trash runs and the row is removed.
+	fired := 0
+	resetHooks()
+	RegisterHook("note", ActionOnTrash, func(_ context.Context, _ *Event) error { fired++; return nil })
+	t.Cleanup(resetHooks)
+	if err := Delete(context.Background(), "acme", "note", ing.Name); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if fired != 1 {
+		t.Fatalf("on_trash fired %d times, want 1", fired)
+	}
+	if _, err := s.State.store.GetDocument(context.Background(), "acme", "note", ing.Name); err == nil {
+		t.Error("document still present after Delete")
+	}
+
+	// A missing document is ErrNotFound (idempotent from the caller's view).
+	if err := Delete(context.Background(), "acme", "note", "nope"); err != ErrNotFound {
+		t.Errorf("Delete of missing doc = %v, want ErrNotFound", err)
+	}
+
+	// A gate error aborts the delete.
+	ing2, _ := Ingest(context.Background(), "acme", "note", map[string]any{"title": "y"}, "")
+	resetHooks()
+	RegisterHook("note", ActionOnTrash, func(_ context.Context, _ *Event) error { return context.Canceled })
+	if err := Delete(context.Background(), "acme", "note", ing2.Name); err == nil {
+		t.Error("Delete must surface an on_trash gate error")
+	}
+	if _, err := s.State.store.GetDocument(context.Background(), "acme", "note", ing2.Name); err != nil {
+		t.Error("document should remain after an aborted delete")
+	}
+}

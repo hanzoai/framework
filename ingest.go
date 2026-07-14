@@ -150,6 +150,44 @@ func FindByField(ctx context.Context, org, doctype, field, value string) (string
 	return docs[0].Name, nil
 }
 
+// Delete removes a document in-process — the twin of the HTTP DELETE: it loads the
+// document, runs the on_trash gate hooks (a returned error aborts the delete), then
+// removes the row. `org` MUST be a validated tenant the caller already resolved. A
+// first-party subsystem (the KB lane reconciling wikilink edges when a page is
+// re-saved or trashed) uses it so edge cleanup runs the SAME lifecycle path as any
+// other delete — never a forked write path. It returns ErrNotFound when the
+// document does not exist (idempotent from the caller's view: a missing edge is a
+// no-op).
+func Delete(ctx context.Context, org, doctype, name string) error {
+	s := mounted
+	if s == nil || s.State.store == nil {
+		return fmt.Errorf("framework: not mounted")
+	}
+	if org == "" {
+		return fmt.Errorf("framework.Delete: empty org")
+	}
+	dt, err := s.State.store.GetDocType(ctx, org, doctype)
+	if err != nil {
+		return fmt.Errorf("framework.Delete: doctype %q: %w", doctype, err)
+	}
+	prev, err := s.State.store.GetDocument(ctx, org, doctype, name)
+	if err != nil {
+		return err
+	}
+	ev := event(s, org, &dt, &prev, nil)
+	if err := runHooks(ctx, ActionOnTrash, ev); err != nil {
+		return err
+	}
+	deleted, err := s.State.store.DeleteDocument(ctx, org, doctype, name)
+	if err != nil {
+		return err
+	}
+	if !deleted {
+		return errNotFound
+	}
+	return nil
+}
+
 // Search is the in-process, org-scoped document list a first-party subsystem (the
 // KB retrieval surface) uses to hydrate search hits or count ingested docs without
 // re-implementing the store query. It is a thin, validated pass-through to
