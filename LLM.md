@@ -23,6 +23,8 @@ not fork the engine — extend it through DocTypes + hooks.
 | `secret.go`    | argon2id hashing for Password fields |
 | `permission.go`| per-org role resolution + the `can(doctype, right)` gate |
 | `hook.go`      | the Go lifecycle hook interface + registry |
+| `module.go`    | app-lane fixture registry (`RegisterModule` + per-org install) |
+| `ingest.go`    | in-process API for first-party producers: `Ingest`/`UpdateData`/`Delete`/`Get`/`Search`/`FindByField` — the SAME validate + lifecycle-hook pipeline as the HTTP path, org supplied by the already-validated caller |
 | `framework.go` | Mount + HTTP handlers + registration |
 
 ## Tenant isolation (the security boundary)
