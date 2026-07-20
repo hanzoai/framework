@@ -50,37 +50,39 @@ func Mount(app *zip.App, deps cloud.Deps) error {
 	s := &cloud.Service[state]{Base: cloud.NewBase(deps, "framework"), State: state{store: store}}
 	mounted = s
 
+	g := app.Group("/v1/framework")
+
 	// STATIC routes register BEFORE the generic /:doctype routes so Fiber's
 	// first-match scan resolves them unambiguously; their names are also reserved
 	// DocType names (see reservedDocTypeNames), so no document route can shadow them.
-	app.Get("/v1/framework/summary", cloud.Handle(s, summary))
+	g.Get("/summary", cloud.Handle(s, summary))
 
-	app.Get("/v1/framework/doctypes", cloud.Handle(s, listDocTypes))
-	app.Post("/v1/framework/doctypes", cloud.Handle(s, createDocType))
-	app.Get("/v1/framework/doctypes/:name", cloud.Handle(s, getDocType))
-	app.Put("/v1/framework/doctypes/:name", cloud.Handle(s, replaceDocType))
-	app.Delete("/v1/framework/doctypes/:name", cloud.Handle(s, deleteDocType))
+	g.Get("/doctypes", cloud.Handle(s, listDocTypes))
+	g.Post("/doctypes", cloud.Handle(s, createDocType))
+	g.Get("/doctypes/:name", cloud.Handle(s, getDocType))
+	g.Put("/doctypes/:name", cloud.Handle(s, replaceDocType))
+	g.Delete("/doctypes/:name", cloud.Handle(s, deleteDocType))
 
-	app.Get("/v1/framework/roles", cloud.Handle(s, listRoles))
-	app.Post("/v1/framework/roles", cloud.Handle(s, assignRole))
-	app.Delete("/v1/framework/roles/:user/:role", cloud.Handle(s, revokeRole))
+	g.Get("/roles", cloud.Handle(s, listRoles))
+	g.Post("/roles", cloud.Handle(s, assignRole))
+	g.Delete("/roles/:user/:role", cloud.Handle(s, revokeRole))
 
 	// App-lane module fixtures: list the registered lanes, inspect one, and
 	// install its DocType fixtures into the caller's org. Registered BEFORE the
 	// generic /:doctype routes so "modules" resolves to these static handlers, and
 	// "modules" is a reserved DocType name so no document route can shadow them.
-	app.Get("/v1/framework/modules", cloud.Handle(s, listModules))
-	app.Get("/v1/framework/modules/:module", cloud.Handle(s, getModule))
-	app.Post("/v1/framework/modules/:module/install", cloud.Handle(s, installModule))
+	g.Get("/modules", cloud.Handle(s, listModules))
+	g.Get("/modules/:module", cloud.Handle(s, getModule))
+	g.Post("/modules/:module/install", cloud.Handle(s, installModule))
 
 	// GENERIC metadata-driven document surface.
-	app.Get("/v1/framework/:doctype", cloud.Handle(s, listDocuments))
-	app.Post("/v1/framework/:doctype", cloud.Handle(s, createDocument))
-	app.Get("/v1/framework/:doctype/:name", cloud.Handle(s, getDocument))
-	app.Put("/v1/framework/:doctype/:name", cloud.Handle(s, updateDocument))
-	app.Delete("/v1/framework/:doctype/:name", cloud.Handle(s, deleteDocument))
-	app.Post("/v1/framework/:doctype/:name/submit", cloud.Handle(s, submitDocument))
-	app.Post("/v1/framework/:doctype/:name/cancel", cloud.Handle(s, cancelDocument))
+	g.Get("/:doctype", cloud.Handle(s, listDocuments))
+	g.Post("/:doctype", cloud.Handle(s, createDocument))
+	g.Get("/:doctype/:name", cloud.Handle(s, getDocument))
+	g.Put("/:doctype/:name", cloud.Handle(s, updateDocument))
+	g.Delete("/:doctype/:name", cloud.Handle(s, deleteDocument))
+	g.Post("/:doctype/:name/submit", cloud.Handle(s, submitDocument))
+	g.Post("/:doctype/:name/cancel", cloud.Handle(s, cancelDocument))
 
 	log.Info("framework mounted", "brand", deps.Brand)
 	return nil
