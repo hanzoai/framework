@@ -93,6 +93,28 @@ func Installed(ctx context.Context, org, doctype string) bool {
 	return err == nil
 }
 
+// ModuleInstalled reports whether the content model of `module` resolves for `org`
+// — the org installed the lane (or the lane is always-on). It is the
+// module-granularity sibling of Installed: an observe/growth reader asks "does this
+// org run cms/erp?" without importing the framework store. A module is present when
+// ANY of its registered DocType fixtures resolves for the org (GetDocType satisfies
+// an always-on fixture for every org and an opt-in fixture only where the org ran
+// the install). Org-scoped (each GetDocType keys on `org`) and nil-safe: an
+// unmounted framework, an unknown module, or a store miss all yield false — never a
+// spurious true and never any org's data (only the boolean).
+func ModuleInstalled(ctx context.Context, org, module string) bool {
+	s := mounted
+	if s == nil || s.State.store == nil {
+		return false
+	}
+	for _, dt := range moduleFixtures(module) {
+		if _, err := s.State.store.GetDocType(ctx, org, dt.Name); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // UpdateData replaces the data of an existing document (draft only), running the
 // before_save + after_save hooks — the in-process twin of the HTTP PUT. A connector
 // uses it to refresh an already-ingested kb-source (same external_id) on re-sync so
