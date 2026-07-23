@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -154,6 +155,14 @@ func (s *Store) GetDocType(ctx context.Context, org, name string) (DocType, erro
 		 FROM fw_doctypes WHERE org=? AND name=?`, org, name)
 	dt, err := scanDocType(row)
 	if errors.Is(err, sql.ErrNoRows) {
+		// No stored (per-org) definition. An always-on module's fixture resolves
+		// virtually so a fresh org uses the lane without a per-org install. Only the
+		// DocType DEFINITION resolves this way — every document row stays physically
+		// org-scoped (see always_on_isolation_test.go), so this exposes schema, never
+		// another org's data.
+		if fx, ok := alwaysOnDocType(name); ok {
+			return fx, nil
+		}
 		return DocType{}, errNotFound
 	}
 	if err != nil {
@@ -171,14 +180,29 @@ func (s *Store) ListDocTypes(ctx context.Context, org string) ([]DocType, error)
 	}
 	defer func() { _ = rows.Close() }()
 	out := make([]DocType, 0, 16)
+	seen := make(map[string]bool, 16)
 	for rows.Next() {
 		dt, err := scanDocType(rows)
 		if err != nil {
 			return nil, fmt.Errorf("scan doctype: %w", err)
 		}
 		out = append(out, dt)
+		seen[dt.Name] = true
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Union the always-on fixtures this org has NOT customized (a stored row wins), so
+	// the listing matches GetDocType. Then re-sort by name to preserve the ORDER BY
+	// name ASC contract across the union.
+	for _, fx := range alwaysOnDocTypes() {
+		if !seen[fx.Name] {
+			out = append(out, fx)
+			seen[fx.Name] = true
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }
 
 // ReplaceDocType replaces an existing DocType's definition (PUT semantics). The
