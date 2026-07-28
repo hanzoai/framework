@@ -37,7 +37,7 @@ func TestAlwaysOn_RecordsStayOrgIsolated(t *testing.T) {
 	}
 
 	// org B cannot GET org A's record by name, even though the DocType resolves for B.
-	if _, err := s.GetDocument(ctx, "orgb", "Flyer", saved.Name); !errors.Is(err, errNotFound) {
+	if _, err := s.GetDocument(ctx, "orgb", "Flyer", saved.Name); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-tenant read of org A's record must 404 for org B, got %v", err)
 	}
 	// org B's listing of the always-on DocType is empty — A's record never appears.

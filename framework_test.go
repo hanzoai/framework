@@ -2,6 +2,7 @@ package framework
 
 import (
 	"context"
+	"github.com/hanzoai/doctype"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -12,7 +13,7 @@ import (
 
 func testStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := openStore(filepath.Join(t.TempDir(), "framework.db"))
+	s, err := openStore(filepath.Join(t.TempDir(), "framework.db"), nil)
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -126,8 +127,8 @@ func TestFieldTypeValidation(t *testing.T) {
 			if err == nil {
 				t.Fatalf("want rejection, got nil")
 			}
-			if b.isRef && err != errBadRef {
-				t.Fatalf("want errBadRef, got %v", err)
+			if b.isRef && err != ErrBadRef {
+				t.Fatalf("want ErrBadRef, got %v", err)
 			}
 		})
 	}
@@ -149,10 +150,10 @@ func TestPasswordHashedAndRedacted(t *testing.T) {
 		t.Fatalf("validate: %v", err)
 	}
 	stored, _ := out["secret"].(string)
-	if stored == "hunter2" || stored == "" || !isHashed(stored) {
+	if stored == "hunter2" || stored == "" || !doctype.IsHashed(stored) {
 		t.Fatalf("secret not hashed: %q", stored)
 	}
-	if !verifyPassword(stored, "hunter2") || verifyPassword(stored, "wrong") {
+	if !doctype.VerifyPassword(stored, "hunter2") || doctype.VerifyPassword(stored, "wrong") {
 		t.Fatalf("argon2 verify broken")
 	}
 
@@ -160,14 +161,14 @@ func TestPasswordHashedAndRedacted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	// wireDoc must redact — never the hash, never plaintext.
-	wire := wireDoc(&dt, saved, nil)
-	if wire["secret"] != redactedMarker {
+	// Wire must redact — never the hash, never plaintext.
+	wire := Doc{Document: saved, Meta: &dt}.Wire(nil)
+	if wire["secret"] != doctype.RedactedMarker {
 		t.Fatalf("secret not redacted on wire: %v", wire["secret"])
 	}
 
 	// Update WITHOUT resending the password (redacted marker) preserves the hash.
-	upd, err := s.validateDoc(ctx, org, &dt, map[string]any{"key": "k1", "secret": redactedMarker}, saved.Data, saved.Name, false)
+	upd, err := s.validateDoc(ctx, org, &dt, map[string]any{"key": "k1", "secret": doctype.RedactedMarker}, saved.Data, saved.Name, false)
 	if err != nil {
 		t.Fatalf("update validate: %v", err)
 	}
@@ -195,8 +196,8 @@ func TestNaming(t *testing.T) {
 		t.Fatalf("field naming want ABC, got %q", df.Name)
 	}
 	// duplicate name → conflict.
-	if _, err := s.CreateDocument(ctx, org, &fieldDT, out, ""); err != errConflict {
-		t.Fatalf("dup field name want errConflict, got %v", err)
+	if _, err := s.CreateDocument(ctx, org, &fieldDT, out, ""); err != ErrConflict {
+		t.Fatalf("dup field name want ErrConflict, got %v", err)
 	}
 
 	promptDT := mustDocType(t, s, org, DocType{Name: "P", Autoname: "prompt", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}})
@@ -226,13 +227,13 @@ func TestNaming(t *testing.T) {
 // TestExpandSeries covers the pure pattern parser with a fixed date.
 func TestExpandSeries(t *testing.T) {
 	now := time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC)
-	ser := expandSeries("INV-.YYYY.-.#####", now)
-	if got := ser.format(7); got != "INV-2026-00007" {
+	ser := doctype.ExpandSeries("INV-.YYYY.-.#####", now)
+	if got := ser.Format(7); got != "INV-2026-00007" {
 		t.Fatalf("format want INV-2026-00007, got %q", got)
 	}
 	// No '#' run → default 5-digit counter appended.
-	ser2 := expandSeries("TASK-", now)
-	if got := ser2.format(3); got != "TASK-00003" {
+	ser2 := doctype.ExpandSeries("TASK-", now)
+	if got := ser2.Format(3); got != "TASK-00003" {
 		t.Fatalf("no-hash want TASK-00003, got %q", got)
 	}
 }
@@ -286,13 +287,13 @@ func TestDocStatusLifecycle(t *testing.T) {
 	if err != nil || sub.DocStatus != 1 {
 		t.Fatalf("submit want docstatus 1, got %d (%v)", sub.DocStatus, err)
 	}
-	// double submit → errBadState
-	if _, err := s.SetDocStatus(ctx, org, "JE", d.Name, 0, 1); err != errBadState {
-		t.Fatalf("double submit want errBadState, got %v", err)
+	// double submit → ErrBadState
+	if _, err := s.SetDocStatus(ctx, org, "JE", d.Name, 0, 1); err != ErrBadState {
+		t.Fatalf("double submit want ErrBadState, got %v", err)
 	}
-	// edit submitted → errBadState
-	if _, err := s.UpdateDocument(ctx, org, &dt, d.Name, map[string]any{"memo": "y"}); err != errBadState {
-		t.Fatalf("edit submitted want errBadState, got %v", err)
+	// edit submitted → ErrBadState
+	if _, err := s.UpdateDocument(ctx, org, &dt, d.Name, map[string]any{"memo": "y"}); err != ErrBadState {
+		t.Fatalf("edit submitted want ErrBadState, got %v", err)
 	}
 	// cancel 1→2
 	can, err := s.SetDocStatus(ctx, org, "JE", d.Name, 1, 2)
@@ -310,11 +311,11 @@ func TestPerOrgIsolation_Store(t *testing.T) {
 	docA, _ := s.CreateDocument(ctx, "orgA", &dtA, map[string]any{"body": "secret A"}, "")
 
 	// orgB has no such doctype.
-	if _, err := s.GetDocType(ctx, "orgB", "Note"); err != errNotFound {
+	if _, err := s.GetDocType(ctx, "orgB", "Note"); err != ErrNotFound {
 		t.Fatalf("orgB must not see orgA doctype, got %v", err)
 	}
 	// orgB cannot read orgA's document even by exact name.
-	if _, err := s.GetDocument(ctx, "orgB", "Note", docA.Name); err != errNotFound {
+	if _, err := s.GetDocument(ctx, "orgB", "Note", docA.Name); err != ErrNotFound {
 		t.Fatalf("orgB must not read orgA doc, got %v", err)
 	}
 	// orgB's list of Note is empty.
@@ -354,7 +355,7 @@ func TestHooks(t *testing.T) {
 	// on_submit gate: refuse to submit when n is negative.
 	RegisterHook("Hooked", ActionOnSubmit, func(_ context.Context, ev *Event) error {
 		if n, _ := ev.Doc.Data["n"].(int64); n < 0 {
-			return validationErrorf("n must be non-negative to submit")
+			return doctype.Errorf("n must be non-negative to submit")
 		}
 		return nil
 	})

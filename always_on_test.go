@@ -3,6 +3,7 @@ package framework
 import (
 	"context"
 	"errors"
+	"github.com/hanzoai/doctype"
 	"testing"
 )
 
@@ -21,10 +22,10 @@ func alwaysOnFixtures() []DocType {
 // the process-global registry afterward.
 func withAlwaysOnModule(t *testing.T, module string, fx []DocType) {
 	t.Helper()
-	resetModules()
+	doctype.ResetModules()
 	RegisterModule(module, fx)
 	MarkAlwaysOn(module)
-	t.Cleanup(resetModules)
+	t.Cleanup(doctype.ResetModules)
 }
 
 // TestAlwaysOn_ResolvesFixtureForFreshOrg: an always-on module's DocType resolves
@@ -46,7 +47,7 @@ func TestAlwaysOn_ResolvesFixtureForFreshOrg(t *testing.T) {
 	if dt.Module != "promo" {
 		t.Fatalf("resolved fixture must be module-stamped, got %q", dt.Module)
 	}
-	if _, ok := dt.field("title"); !ok {
+	if _, ok := dt.Field("title"); !ok {
 		t.Fatal("resolved fixture must carry its declared fields")
 	}
 	// normalize() seeded the secure-by-default System Manager grant.
@@ -55,12 +56,12 @@ func TestAlwaysOn_ResolvesFixtureForFreshOrg(t *testing.T) {
 	}
 
 	// A NON-always-on module's DocType is NOT resolved — it still requires install.
-	if _, err := s.GetDocType(ctx, "acme", "Ledger"); !errors.Is(err, errNotFound) {
+	if _, err := s.GetDocType(ctx, "acme", "Ledger"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("opt-in module's DocType must NOT resolve without install, got %v", err)
 	}
 	// An entirely unknown name is still 404.
-	if _, err := s.GetDocType(ctx, "acme", "Nope"); !errors.Is(err, errNotFound) {
-		t.Fatalf("unknown DocType want errNotFound, got %v", err)
+	if _, err := s.GetDocType(ctx, "acme", "Nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown DocType want ErrNotFound, got %v", err)
 	}
 }
 
@@ -85,10 +86,10 @@ func TestAlwaysOn_StoredDefinitionWins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetDocType after customize: %v", err)
 	}
-	if _, ok := got.field("cta"); !ok {
+	if _, ok := got.Field("cta"); !ok {
 		t.Fatal("the STORED (customized) definition must win over the fixture")
 	}
-	if _, ok := got.field("body"); ok {
+	if _, ok := got.Field("body"); ok {
 		t.Fatal("the fixture must NOT be merged into a stored override")
 	}
 
@@ -98,7 +99,7 @@ func TestAlwaysOn_StoredDefinitionWins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("other org must still resolve the fixture, got %v", err)
 	}
-	if _, ok := other.field("body"); !ok {
+	if _, ok := other.Field("body"); !ok {
 		t.Fatal("a non-customizing org must still see the fixture, not acme's override")
 	}
 }
