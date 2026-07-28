@@ -3,7 +3,7 @@ module github.com/hanzoai/framework
 go 1.26.5
 
 require (
-	github.com/hanzoai/doctype v0.0.0
+	github.com/hanzoai/doctype v0.1.0
 	github.com/hanzoai/sqlite v0.4.0
 	github.com/luxfi/log v1.6.0
 )
@@ -48,5 +48,3 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.51.0 // indirect
 )
-
-replace github.com/hanzoai/doctype => ../doctype
