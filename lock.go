@@ -55,10 +55,9 @@ type Lease struct {
 //   - (nil, false, err)   — a genuine store failure (or ctx cancellation).
 //
 // `ttl` MUST exceed the guarded section so a live holder is never pre-empted mid-flight.
-func AcquireLease(ctx context.Context, org, key string, ttl, wait time.Duration) (*Lease, bool, error) {
-	s := mounted
-	if s == nil || s.State.store == nil {
-		return nil, false, fmt.Errorf("framework: not mounted")
+func (e *Engine) AcquireLease(ctx context.Context, org, key string, ttl, wait time.Duration) (*Lease, bool, error) {
+	if err := e.ready(); err != nil {
+		return nil, false, err
 	}
 	if org == "" || key == "" {
 		return nil, false, fmt.Errorf("framework.AcquireLease: empty org/key")
@@ -69,12 +68,12 @@ func AcquireLease(ctx context.Context, org, key string, ttl, wait time.Duration)
 	}
 	deadline := time.Now().Add(wait)
 	for {
-		ok, err := s.State.store.acquireLock(ctx, org, key, holder, ttl)
+		ok, err := e.store.acquireLock(ctx, org, key, holder, ttl)
 		if err != nil {
 			return nil, false, err
 		}
 		if ok {
-			return &Lease{store: s.State.store, org: org, key: key, holder: holder}, true, nil
+			return &Lease{store: e.store, org: org, key: key, holder: holder}, true, nil
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {

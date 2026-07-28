@@ -2,6 +2,7 @@ package framework
 
 import (
 	"context"
+	"github.com/hanzoai/doctype"
 	"testing"
 )
 
@@ -10,16 +11,16 @@ import (
 // honest-degrading: it reports a module present ONLY for the org that installed it,
 // an unknown module reads false, and the boolean never exposes another org's data.
 func TestModuleInstalled_OrgScoped(t *testing.T) {
-	s, done := mountForIngest(t) // sets the package-global `mounted` ModuleInstalled reads
+	s, done := mountForIngest(t)
 	defer done()
 	ctx := context.Background()
 
-	resetModules()
-	t.Cleanup(resetModules)
+	doctype.ResetModules()
+	t.Cleanup(doctype.ResetModules)
 	RegisterModule("shop", []DocType{{Name: "Widget", Fields: []DocField{{Fieldname: "sku", Fieldtype: FieldData}}}})
 
 	// orgA installs the module's doctype; orgB installs nothing.
-	if _, err := s.State.store.CreateDocType(ctx, "orgA", DocType{
+	if _, err := s.store.CreateDocType(ctx, "orgA", DocType{
 		Name: "Widget", Module: "shop",
 		Fields: []DocField{{Fieldname: "sku", Fieldtype: FieldData}},
 		Perms:  []DocPerm{{Role: RoleSystemManager, Read: true, Write: true, Create: true, Delete: true}},
@@ -27,13 +28,13 @@ func TestModuleInstalled_OrgScoped(t *testing.T) {
 		t.Fatalf("install: %v", err)
 	}
 
-	if !ModuleInstalled(ctx, "orgA", "shop") {
+	if !s.ModuleInstalled(ctx, "orgA", "shop") {
 		t.Fatal("orgA installed shop → ModuleInstalled must be true")
 	}
-	if ModuleInstalled(ctx, "orgB", "shop") {
+	if s.ModuleInstalled(ctx, "orgB", "shop") {
 		t.Fatal("cross-tenant leak: orgB must NOT observe orgA's installed module")
 	}
-	if ModuleInstalled(ctx, "orgA", "not-a-module") {
+	if s.ModuleInstalled(ctx, "orgA", "not-a-module") {
 		t.Fatal("an unregistered module must read false")
 	}
 }

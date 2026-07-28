@@ -15,18 +15,8 @@ import (
 	// mattn+SQLCipher, encrypted at rest; !cgo → pure-Go modernc). Importing
 	// modernc directly instead would double-register "sqlite" under CGO and
 	// panic at init. Blank import registers the driver.
-	"github.com/hanzoai/cloud/cek"
+	"github.com/hanzoai/doctype"
 	_ "github.com/hanzoai/sqlite"
-)
-
-// Sentinel errors. The HTTP layer maps these to status codes:
-//
-//	errNotFound → 404, errConflict → 409, errBadRef → 422, errBadState → 409.
-var (
-	errNotFound = errors.New("framework: not found")
-	errConflict = errors.New("framework: already exists")
-	errBadRef   = errors.New("framework: referenced record not found in org")
-	errBadState = errors.New("framework: illegal docstatus transition")
 )
 
 // Store is the framework database. ONE SQLite file ({DataDir}/framework.db) holds
@@ -38,8 +28,14 @@ type Store struct {
 	db *sql.DB
 }
 
-func openStore(path string) (*Store, error) {
-	db, err := cek.Open(path)
+// openStore opens (and migrates) the engine's database. `open` is the host's
+// opener — nil means the plain hanzoai/sqlite driver, which is what a
+// standalone app or a test wants; Hanzo Cloud injects an encrypted-at-rest one.
+func openStore(path string, open OpenDBFunc) (*Store, error) {
+	if open == nil {
+		open = func(p string) (*sql.DB, error) { return sql.Open("sqlite", p) }
+	}
+	db, err := open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
 	}
@@ -130,7 +126,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // ---- DocType registry ----
 
 func (s *Store) CreateDocType(ctx context.Context, org string, dt DocType) (DocType, error) {
-	dt.normalize()
+	dt.Normalize()
 	now := time.Now().Unix()
 	dt.CreatedAt, dt.UpdatedAt = now, now
 	fieldsJSON, _ := json.Marshal(dt.Fields)
@@ -142,7 +138,7 @@ func (s *Store) CreateDocType(ctx context.Context, org string, dt DocType) (DocT
 		string(fieldsJSON), string(permsJSON), now, now)
 	if err != nil {
 		if isUnique(err) {
-			return DocType{}, errConflict
+			return DocType{}, ErrConflict
 		}
 		return DocType{}, fmt.Errorf("insert doctype: %w", err)
 	}
@@ -160,10 +156,10 @@ func (s *Store) GetDocType(ctx context.Context, org, name string) (DocType, erro
 		// DocType DEFINITION resolves this way — every document row stays physically
 		// org-scoped (see always_on_isolation_test.go), so this exposes schema, never
 		// another org's data.
-		if fx, ok := alwaysOnDocType(name); ok {
+		if fx, ok := doctype.AlwaysOn(name); ok {
 			return fx, nil
 		}
-		return DocType{}, errNotFound
+		return DocType{}, ErrNotFound
 	}
 	if err != nil {
 		return DocType{}, fmt.Errorf("get doctype: %w", err)
@@ -195,7 +191,7 @@ func (s *Store) ListDocTypes(ctx context.Context, org string) ([]DocType, error)
 	// Union the always-on fixtures this org has NOT customized (a stored row wins), so
 	// the listing matches GetDocType. Then re-sort by name to preserve the ORDER BY
 	// name ASC contract across the union.
-	for _, fx := range alwaysOnDocTypes() {
+	for _, fx := range doctype.AlwaysOnAll() {
 		if !seen[fx.Name] {
 			out = append(out, fx)
 			seen[fx.Name] = true
@@ -209,7 +205,7 @@ func (s *Store) ListDocTypes(ctx context.Context, org string) ([]DocType, error)
 // documents already stored under it are left intact (a schema change never
 // silently drops data); the next write validates against the new schema.
 func (s *Store) ReplaceDocType(ctx context.Context, org string, dt DocType) (DocType, error) {
-	dt.normalize()
+	dt.Normalize()
 	fieldsJSON, _ := json.Marshal(dt.Fields)
 	permsJSON, _ := json.Marshal(dt.Perms)
 	now := time.Now().Unix()
@@ -222,7 +218,7 @@ func (s *Store) ReplaceDocType(ctx context.Context, org string, dt DocType) (Doc
 		return DocType{}, fmt.Errorf("update doctype: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return DocType{}, errNotFound
+		return DocType{}, ErrNotFound
 	}
 	return s.GetDocType(ctx, org, dt.Name)
 }
@@ -305,8 +301,8 @@ func (s *Store) CreateDocument(ctx context.Context, org string, dt *DocType, dat
 	}
 
 	switch {
-	case isSeriesNaming(dt.Autoname):
-		ser := expandSeries(dt.Autoname, time.Now())
+	case doctype.IsSeries(dt.Autoname):
+		ser := doctype.ExpandSeries(dt.Autoname, time.Now())
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return Document{}, fmt.Errorf("begin: %w", err)
@@ -316,10 +312,10 @@ func (s *Store) CreateDocument(ctx context.Context, org string, dt *DocType, dat
 		if err != nil {
 			return Document{}, err
 		}
-		name := ser.format(n)
+		name := ser.Format(n)
 		if err := insert(ctx, tx, name); err != nil {
 			if isUnique(err) {
-				return Document{}, errConflict
+				return Document{}, ErrConflict
 			}
 			return Document{}, fmt.Errorf("insert document: %w", err)
 		}
@@ -329,13 +325,13 @@ func (s *Store) CreateDocument(ctx context.Context, org string, dt *DocType, dat
 		return Document{Name: name, DocType: dt.Name, Data: data, CreatedAt: now, UpdatedAt: now}, nil
 
 	default:
-		name, err := resolveName(dt, data, requestedName)
+		name, err := doctype.ResolveName(dt, data, requestedName)
 		if err != nil {
 			return Document{}, err
 		}
 		if err := insert(ctx, s.db, name); err != nil {
 			if isUnique(err) {
-				return Document{}, errConflict
+				return Document{}, ErrConflict
 			}
 			return Document{}, fmt.Errorf("insert document: %w", err)
 		}
@@ -361,13 +357,13 @@ func (s *Store) UpsertSingle(ctx context.Context, org string, dt *DocType, data 
 	return s.GetDocument(ctx, org, dt.Name, dt.Name)
 }
 
-func (s *Store) GetDocument(ctx context.Context, org, doctype, name string) (Document, error) {
+func (s *Store) GetDocument(ctx context.Context, org, dtName, name string) (Document, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT name,docstatus,data,created_at,updated_at FROM fw_documents WHERE org=? AND doctype=? AND name=?`,
-		org, doctype, name)
-	d, err := scanDocument(row, doctype)
+		org, dtName, name)
+	d, err := scanDocument(row, dtName)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Document{}, errNotFound
+		return Document{}, ErrNotFound
 	}
 	if err != nil {
 		return Document{}, fmt.Errorf("get document: %w", err)
@@ -388,10 +384,10 @@ type ListOpts struct {
 // filters (via json_extract, all values BOUND), an order key, and a bounded
 // limit. Every value is a bound parameter and every field name is validated
 // against the doctype's schema before it reaches a json path.
-func (s *Store) ListDocuments(ctx context.Context, org, doctype string, opts ListOpts) ([]Document, error) {
+func (s *Store) ListDocuments(ctx context.Context, org, dtName string, opts ListOpts) ([]Document, error) {
 	var (
 		where = []string{"org=?", "doctype=?"}
-		args  = []any{org, doctype}
+		args  = []any{org, dtName}
 	)
 	for field, val := range opts.Filters {
 		switch field {
@@ -426,8 +422,8 @@ func (s *Store) ListDocuments(ctx context.Context, org, doctype string, opts Lis
 		dir = "ASC"
 	}
 	limit := opts.Limit
-	if limit <= 0 || limit > maxLimit {
-		limit = defaultLimit
+	if limit <= 0 || limit > doctype.MaxLimit {
+		limit = doctype.DefaultLimit
 	}
 
 	q := `SELECT name,docstatus,data,created_at,updated_at FROM fw_documents WHERE ` +
@@ -444,7 +440,7 @@ func (s *Store) ListDocuments(ctx context.Context, org, doctype string, opts Lis
 	defer func() { _ = rows.Close() }()
 	out := make([]Document, 0, 16)
 	for rows.Next() {
-		d, err := scanDocument(rows, doctype)
+		d, err := scanDocument(rows, dtName)
 		if err != nil {
 			return nil, fmt.Errorf("scan document: %w", err)
 		}
@@ -454,7 +450,7 @@ func (s *Store) ListDocuments(ctx context.Context, org, doctype string, opts Lis
 }
 
 // UpdateDocument replaces a document's data. Only a DRAFT (docstatus 0) is
-// editable — a submitted/cancelled document is immutable (errBadState) so the
+// editable — a submitted/cancelled document is immutable (ErrBadState) so the
 // submit lifecycle can't be bypassed by a plain PUT. `data` is already validated.
 func (s *Store) UpdateDocument(ctx context.Context, org string, dt *DocType, name string, data map[string]any) (Document, error) {
 	blob, err := json.Marshal(data)
@@ -470,13 +466,13 @@ func (s *Store) UpdateDocument(ctx context.Context, org string, dt *DocType, nam
 	err = tx.QueryRowContext(ctx, `SELECT docstatus FROM fw_documents WHERE org=? AND doctype=? AND name=?`,
 		org, dt.Name, name).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Document{}, errNotFound
+		return Document{}, ErrNotFound
 	}
 	if err != nil {
 		return Document{}, fmt.Errorf("lock document: %w", err)
 	}
 	if status != 0 {
-		return Document{}, errBadState
+		return Document{}, ErrBadState
 	}
 	now := time.Now().Unix()
 	if _, err := tx.ExecContext(ctx, `UPDATE fw_documents SET data=?, updated_at=? WHERE org=? AND doctype=? AND name=?`,
@@ -490,10 +486,10 @@ func (s *Store) UpdateDocument(ctx context.Context, org string, dt *DocType, nam
 }
 
 // SetDocStatus transitions a document from `from` to `to` atomically, verifying
-// the current status equals `from` (else errBadState). This is the ONE path for
+// the current status equals `from` (else ErrBadState). This is the ONE path for
 // submit (0→1) and cancel (1→2); the check-and-set is inside a transaction so two
 // concurrent submits can't both win.
-func (s *Store) SetDocStatus(ctx context.Context, org, doctype, name string, from, to int) (Document, error) {
+func (s *Store) SetDocStatus(ctx context.Context, org, dtName, name string, from, to int) (Document, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Document{}, fmt.Errorf("begin: %w", err)
@@ -501,31 +497,31 @@ func (s *Store) SetDocStatus(ctx context.Context, org, doctype, name string, fro
 	defer func() { _ = tx.Rollback() }()
 	var status int
 	err = tx.QueryRowContext(ctx, `SELECT docstatus FROM fw_documents WHERE org=? AND doctype=? AND name=?`,
-		org, doctype, name).Scan(&status)
+		org, dtName, name).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Document{}, errNotFound
+		return Document{}, ErrNotFound
 	}
 	if err != nil {
 		return Document{}, fmt.Errorf("lock document: %w", err)
 	}
 	if status != from {
-		return Document{}, errBadState
+		return Document{}, ErrBadState
 	}
 	now := time.Now().Unix()
 	if _, err := tx.ExecContext(ctx, `UPDATE fw_documents SET docstatus=?, updated_at=? WHERE org=? AND doctype=? AND name=?`,
-		to, now, org, doctype, name); err != nil {
+		to, now, org, dtName, name); err != nil {
 		return Document{}, fmt.Errorf("set docstatus: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return Document{}, fmt.Errorf("commit: %w", err)
 	}
-	return s.GetDocument(ctx, org, doctype, name)
+	return s.GetDocument(ctx, org, dtName, name)
 }
 
 // DeleteDocument removes a document by key. Returns false if absent. The service
 // enforces the lifecycle guard (a submitted doc must be cancelled first).
-func (s *Store) DeleteDocument(ctx context.Context, org, doctype, name string) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM fw_documents WHERE org=? AND doctype=? AND name=?`, org, doctype, name)
+func (s *Store) DeleteDocument(ctx context.Context, org, dtName, name string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM fw_documents WHERE org=? AND doctype=? AND name=?`, org, dtName, name)
 	if err != nil {
 		return false, fmt.Errorf("delete document: %w", err)
 	}
@@ -534,13 +530,13 @@ func (s *Store) DeleteDocument(ctx context.Context, org, doctype, name string) (
 }
 
 // CountDocuments returns the org's document count for a doctype (real, per-org).
-func (s *Store) CountDocuments(ctx context.Context, org, doctype string) (int, error) {
+func (s *Store) CountDocuments(ctx context.Context, org, dtName string) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM fw_documents WHERE org=? AND doctype=?`, org, doctype).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM fw_documents WHERE org=? AND doctype=?`, org, dtName).Scan(&n)
 	return n, err
 }
 
-func scanDocument(sc interface{ Scan(...any) error }, doctype string) (Document, error) {
+func scanDocument(sc interface{ Scan(...any) error }, dtName string) (Document, error) {
 	var (
 		d    Document
 		blob string
@@ -548,7 +544,7 @@ func scanDocument(sc interface{ Scan(...any) error }, doctype string) (Document,
 	if err := sc.Scan(&d.Name, &d.DocStatus, &blob, &d.CreatedAt, &d.UpdatedAt); err != nil {
 		return Document{}, err
 	}
-	d.DocType = doctype
+	d.DocType = dtName
 	if err := json.Unmarshal([]byte(blob), &d.Data); err != nil {
 		return Document{}, fmt.Errorf("unmarshal data: %w", err)
 	}
@@ -560,13 +556,13 @@ func scanDocument(sc interface{ Scan(...any) error }, doctype string) (Document,
 
 // documentExists reports whether (org, doctype, name) exists — the in-org Link
 // reference check. table/column are constants; name is a bound parameter.
-func (s *Store) documentExists(ctx context.Context, org, doctype, name string) (bool, error) {
+func (s *Store) documentExists(ctx context.Context, org, dtName, name string) (bool, error) {
 	if name == "" {
 		return false, nil
 	}
 	var one int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT 1 FROM fw_documents WHERE org=? AND doctype=? AND name=?`, org, doctype, name).Scan(&one)
+		`SELECT 1 FROM fw_documents WHERE org=? AND doctype=? AND name=?`, org, dtName, name).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -580,11 +576,11 @@ func (s *Store) documentExists(ctx context.Context, org, doctype, name string) (
 // carries `value` for `field` — the Unique-field check. `field` is validated
 // against the schema before this call and BOUND into the json path; excludeName
 // lets an update skip the row being updated.
-func (s *Store) fieldValueTaken(ctx context.Context, org, doctype, field, value, excludeName string) (bool, error) {
+func (s *Store) fieldValueTaken(ctx context.Context, org, dtName, field, value, excludeName string) (bool, error) {
 	var one int
 	err := s.db.QueryRowContext(ctx,
 		`SELECT 1 FROM fw_documents WHERE org=? AND doctype=? AND name<>? AND CAST(json_extract(data,'$.'||?) AS TEXT)=? LIMIT 1`,
-		org, doctype, excludeName, field, value).Scan(&one)
+		org, dtName, excludeName, field, value).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -663,7 +659,7 @@ func (s *Store) SeedOwnerIfUnowned(ctx context.Context, org, user string) (bool,
 		`INSERT INTO fw_roles (org, usr, role)
 		 SELECT ?, ?, ?
 		 WHERE NOT EXISTS (SELECT 1 FROM fw_roles WHERE org = ?)`,
-		org, user, RoleSystemManager, org)
+		org, user, doctype.RoleSystemManager, org)
 	if err != nil {
 		return false, fmt.Errorf("seed owner: %w", err)
 	}
@@ -719,34 +715,4 @@ func isUnique(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unique constraint") || strings.Contains(msg, "constraint failed")
-}
-
-// resolveName computes a document's name for the non-series naming modes.
-func resolveName(dt *DocType, data map[string]any, requestedName string) (string, error) {
-	switch {
-	case isHashNaming(dt.Autoname):
-		return hashName()
-	case autonameField(dt.Autoname) != "":
-		f := autonameField(dt.Autoname)
-		v, _ := data[f].(string)
-		v = strings.TrimSpace(v)
-		if v == "" {
-			return "", validationErrorf("autoname field %q must have a value", f)
-		}
-		if !docTypeNameRe.MatchString(v) || len(v) > maxNameLen {
-			return "", validationErrorf("autoname field %q is not a valid name", f)
-		}
-		return v, nil
-	case isPromptNaming(dt.Autoname):
-		requestedName = strings.TrimSpace(requestedName)
-		if requestedName == "" {
-			return "", validationErrorf("name is required (autoname: prompt)")
-		}
-		if !docTypeNameRe.MatchString(requestedName) || len(requestedName) > maxNameLen {
-			return "", validationErrorf("name %q is invalid", requestedName)
-		}
-		return requestedName, nil
-	default:
-		return hashName()
-	}
 }

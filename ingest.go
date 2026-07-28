@@ -2,8 +2,9 @@ package framework
 
 import (
 	"context"
-	"errors"
 	"fmt"
+
+	"github.com/hanzoai/doctype"
 )
 
 // ingest.go is the ONE in-process document-create path for first-party producers
@@ -36,60 +37,58 @@ type Ingested struct {
 // tenant the caller already resolved — Ingest does not derive it. `requestedName`
 // is used only for prompt/single naming (empty for the common autoname/hash case).
 //
-// It errors ("framework: not mounted") if called before the subsystem is mounted,
+// It errors if the engine is not open,
 // and surfaces validation/lifecycle/store errors verbatim so a connector can record
 // them on its connection status.
-func Ingest(ctx context.Context, org, doctype string, data map[string]any, requestedName string) (Ingested, error) {
-	s := mounted
-	if s == nil || s.State.store == nil {
-		return Ingested{}, fmt.Errorf("framework: not mounted")
+func (e *Engine) Ingest(ctx context.Context, org, dtName string, data map[string]any, requestedName string) (Ingested, error) {
+	if err := e.ready(); err != nil {
+		return Ingested{}, err
 	}
 	if org == "" {
 		return Ingested{}, fmt.Errorf("framework.Ingest: empty org")
 	}
 
-	dt, err := s.State.store.GetDocType(ctx, org, doctype)
+	dt, err := e.store.GetDocType(ctx, org, dtName)
 	if err != nil {
-		return Ingested{}, fmt.Errorf("framework.Ingest: doctype %q: %w", doctype, err)
+		return Ingested{}, fmt.Errorf("framework.Ingest: doctype %q: %w", dtName, err)
 	}
 
 	// Single doctypes are upserts, not appends; a connector ingests many documents
 	// into a normal (non-single) doctype (kb-source), so reject Single here rather
 	// than silently overwriting the one row.
 	if dt.IsSingle {
-		return Ingested{}, fmt.Errorf("framework.Ingest: %q is a Single doctype", doctype)
+		return Ingested{}, fmt.Errorf("framework.Ingest: %q is a Single doctype", dtName)
 	}
 
-	validated, err := s.State.store.validateDoc(ctx, org, &dt, data, nil, "", false)
+	validated, err := e.store.validateDoc(ctx, org, &dt, data, nil, "", false)
 	if err != nil {
 		return Ingested{}, err
 	}
 	doc := Document{DocType: dt.Name, Data: validated}
-	ev := event(s, org, &dt, &doc, nil)
-	if err := runHooks(ctx, ActionBeforeInsert, ev); err != nil {
+	ev := e.event(org, &dt, &doc, nil)
+	if err := e.gate(ctx, ActionBeforeInsert, ev); err != nil {
 		return Ingested{}, err
 	}
-	if err := runHooks(ctx, ActionBeforeSave, ev); err != nil {
+	if err := e.gate(ctx, ActionBeforeSave, ev); err != nil {
 		return Ingested{}, err
 	}
-	saved, err := s.State.store.CreateDocument(ctx, org, &dt, doc.Data, requestedName)
+	saved, err := e.store.CreateDocument(ctx, org, &dt, doc.Data, requestedName)
 	if err != nil {
 		return Ingested{}, err
 	}
 	// after_save runs the indexing hook (non-fatal, logged) exactly as on the HTTP path.
-	after(s, ctx, org, &dt, &saved, nil)
+	e.after(ctx, org, &dt, &saved, nil)
 	return Ingested{Org: org, DocType: dt.Name, Name: saved.Name}, nil
 }
 
 // Installed reports whether `doctype` exists in `org` (i.e. the module was
 // installed). A connector checks this before a sync so it can return an honest
 // "install the kb module first" rather than a doctype-not-found error mid-sync.
-func Installed(ctx context.Context, org, doctype string) bool {
-	s := mounted
-	if s == nil || s.State.store == nil {
+func (e *Engine) Installed(ctx context.Context, org, dtName string) bool {
+	if e.ready() != nil {
 		return false
 	}
-	_, err := s.State.store.GetDocType(ctx, org, doctype)
+	_, err := e.store.GetDocType(ctx, org, dtName)
 	return err == nil
 }
 
@@ -100,15 +99,14 @@ func Installed(ctx context.Context, org, doctype string) bool {
 // ANY of its registered DocType fixtures resolves for the org (GetDocType satisfies
 // an always-on fixture for every org and an opt-in fixture only where the org ran
 // the install). Org-scoped (each GetDocType keys on `org`) and nil-safe: an
-// unmounted framework, an unknown module, or a store miss all yield false — never a
+// closed engine, an unknown module, or a store miss all yield false — never a
 // spurious true and never any org's data (only the boolean).
-func ModuleInstalled(ctx context.Context, org, module string) bool {
-	s := mounted
-	if s == nil || s.State.store == nil {
+func (e *Engine) ModuleInstalled(ctx context.Context, org, module string) bool {
+	if e.ready() != nil {
 		return false
 	}
-	for _, dt := range moduleFixtures(module) {
-		if _, err := s.State.store.GetDocType(ctx, org, dt.Name); err == nil {
+	for _, dt := range doctype.Fixtures(module) {
+		if _, err := e.store.GetDocType(ctx, org, dt.Name); err == nil {
 			return true
 		}
 	}
@@ -120,33 +118,32 @@ func ModuleInstalled(ctx context.Context, org, module string) bool {
 // uses it to refresh an already-ingested kb-source (same external_id) on re-sync so
 // the vector point is updated in place rather than duplicated. `name` is the
 // engine-assigned document name from a prior Ingest.
-func UpdateData(ctx context.Context, org, doctype, name string, data map[string]any) error {
-	s := mounted
-	if s == nil || s.State.store == nil {
-		return fmt.Errorf("framework: not mounted")
+func (e *Engine) UpdateData(ctx context.Context, org, dtName, name string, data map[string]any) error {
+	if err := e.ready(); err != nil {
+		return err
 	}
-	dt, err := s.State.store.GetDocType(ctx, org, doctype)
+	dt, err := e.store.GetDocType(ctx, org, dtName)
 	if err != nil {
-		return fmt.Errorf("framework.UpdateData: doctype %q: %w", doctype, err)
+		return fmt.Errorf("framework.UpdateData: doctype %q: %w", dtName, err)
 	}
-	prev, err := s.State.store.GetDocument(ctx, org, doctype, name)
+	prev, err := e.store.GetDocument(ctx, org, dtName, name)
 	if err != nil {
 		return err
 	}
-	validated, err := s.State.store.validateDoc(ctx, org, &dt, data, prev.Data, name, false)
+	validated, err := e.store.validateDoc(ctx, org, &dt, data, prev.Data, name, false)
 	if err != nil {
 		return err
 	}
 	doc := Document{Name: name, DocType: dt.Name, Data: validated}
-	ev := event(s, org, &dt, &doc, &prev)
-	if err := runHooks(ctx, ActionBeforeSave, ev); err != nil {
+	ev := e.event(org, &dt, &doc, &prev)
+	if err := e.gate(ctx, ActionBeforeSave, ev); err != nil {
 		return err
 	}
-	saved, err := s.State.store.UpdateDocument(ctx, org, &dt, name, doc.Data)
+	saved, err := e.store.UpdateDocument(ctx, org, &dt, name, doc.Data)
 	if err != nil {
 		return err
 	}
-	after(s, ctx, org, &dt, &saved, &prev)
+	e.after(ctx, org, &dt, &saved, &prev)
 	return nil
 }
 
@@ -154,12 +151,11 @@ func UpdateData(ctx context.Context, org, doctype, name string, data map[string]
 // `field` equals `value`, or "" if none. A connector uses it to find an existing
 // kb-source by external_id (idempotent re-sync: update in place vs. create new).
 // `field` is validated against the doctype schema by ListDocuments' bound json path.
-func FindByField(ctx context.Context, org, doctype, field, value string) (string, error) {
-	s := mounted
-	if s == nil || s.State.store == nil {
-		return "", fmt.Errorf("framework: not mounted")
+func (e *Engine) FindByField(ctx context.Context, org, dtName, field, value string) (string, error) {
+	if err := e.ready(); err != nil {
+		return "", err
 	}
-	docs, err := s.State.store.ListDocuments(ctx, org, doctype, ListOpts{
+	docs, err := e.store.ListDocuments(ctx, org, dtName, ListOpts{
 		Filters: map[string]string{field: value},
 		Limit:   1,
 	})
@@ -180,32 +176,31 @@ func FindByField(ctx context.Context, org, doctype, field, value string) (string
 // other delete — never a forked write path. It returns ErrNotFound when the
 // document does not exist (idempotent from the caller's view: a missing edge is a
 // no-op).
-func Delete(ctx context.Context, org, doctype, name string) error {
-	s := mounted
-	if s == nil || s.State.store == nil {
-		return fmt.Errorf("framework: not mounted")
+func (e *Engine) Delete(ctx context.Context, org, dtName, name string) error {
+	if err := e.ready(); err != nil {
+		return err
 	}
 	if org == "" {
 		return fmt.Errorf("framework.Delete: empty org")
 	}
-	dt, err := s.State.store.GetDocType(ctx, org, doctype)
+	dt, err := e.store.GetDocType(ctx, org, dtName)
 	if err != nil {
-		return fmt.Errorf("framework.Delete: doctype %q: %w", doctype, err)
+		return fmt.Errorf("framework.Delete: doctype %q: %w", dtName, err)
 	}
-	prev, err := s.State.store.GetDocument(ctx, org, doctype, name)
+	prev, err := e.store.GetDocument(ctx, org, dtName, name)
 	if err != nil {
 		return err
 	}
-	ev := event(s, org, &dt, &prev, nil)
-	if err := runHooks(ctx, ActionOnTrash, ev); err != nil {
+	ev := e.event(org, &dt, &prev, nil)
+	if err := e.gate(ctx, ActionOnTrash, ev); err != nil {
 		return err
 	}
-	deleted, err := s.State.store.DeleteDocument(ctx, org, doctype, name)
+	deleted, err := e.store.DeleteDocument(ctx, org, dtName, name)
 	if err != nil {
 		return err
 	}
 	if !deleted {
-		return errNotFound
+		return ErrNotFound
 	}
 	return nil
 }
@@ -214,12 +209,11 @@ func Delete(ctx context.Context, org, doctype, name string) error {
 // KB retrieval surface) uses to hydrate search hits or count ingested docs without
 // re-implementing the store query. It is a thin, validated pass-through to
 // ListDocuments — every result is physically scoped to `org`.
-func Search(ctx context.Context, org, doctype string, filters map[string]string, limit int) ([]Document, error) {
-	s := mounted
-	if s == nil || s.State.store == nil {
-		return nil, fmt.Errorf("framework: not mounted")
+func (e *Engine) Search(ctx context.Context, org, dtName string, filters map[string]string, limit int) ([]Document, error) {
+	if err := e.ready(); err != nil {
+		return nil, err
 	}
-	return s.State.store.ListDocuments(ctx, org, doctype, ListOpts{Filters: filters, Limit: limit})
+	return e.store.ListDocuments(ctx, org, dtName, ListOpts{Filters: filters, Limit: limit})
 }
 
 // Get returns a single document by name in (org, doctype) — the read-one twin of
@@ -227,28 +221,9 @@ func Search(ctx context.Context, org, doctype string, filters map[string]string,
 // document to compute a lifecycle transition). `org` MUST be a validated tenant the
 // caller already resolved. It returns ErrNotFound when the document does not exist, so
 // the caller can answer 404 rather than 500.
-func Get(ctx context.Context, org, doctype, name string) (Document, error) {
-	s := mounted
-	if s == nil || s.State.store == nil {
-		return Document{}, fmt.Errorf("framework: not mounted")
+func (e *Engine) Get(ctx context.Context, org, dtName, name string) (Document, error) {
+	if err := e.ready(); err != nil {
+		return Document{}, err
 	}
-	return s.State.store.GetDocument(ctx, org, doctype, name)
-}
-
-// Exported error sentinels let an in-process caller (e.g. the content lane) classify
-// the errors Ingest/Get/UpdateData/Search return WITHOUT string-matching. They alias
-// the package's internal sentinels — the ONE definition stays in store.go, these are
-// just the public handles.
-var (
-	ErrNotFound = errNotFound
-	ErrConflict = errConflict
-	ErrBadRef   = errBadRef
-)
-
-// IsValidationError reports whether err is a document-schema violation (the 400-class
-// error validateDoc returns), so an in-process caller maps it to Bad Request rather
-// than a 500 — the same *validationError the HTTP layer maps via mapErr.
-func IsValidationError(err error) bool {
-	var ve *validationError
-	return errors.As(err, &ve)
+	return e.store.GetDocument(ctx, org, dtName, name)
 }
