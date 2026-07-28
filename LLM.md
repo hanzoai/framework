@@ -35,6 +35,8 @@ is not a privileged one.
 | `permission.go` | role RESOLUTION, the manager gate, trust-on-first-use owner seeding |
 | `hook.go`       | the Go lifecycle hook interface + registry |
 | `lock.go`       | the store lease: an exclusive, TTL-bounded, cross-process interlock |
+| `changes.go`    | the CHANGE FEED: one durable, ordered, resumable log of every committed write |
+| `presence.go`   | who is viewing a document — a TTL row, announced on the change feed |
 | `ingest.go`     | the in-process API for first-party producers (`Ingest`/`Get`/`Search`/…) |
 | `wire.go`       | `Doc.Wire` (the redaction choke point) + `ParseListQuery` + `BindDocument` |
 | `errors.go`     | sentinels, `HookAbort`, and `Classify` — what a failure MEANS |
@@ -142,6 +144,61 @@ hooks therefore run BEFORE the state change: an error aborts the operation
 before anything is written, and the engine wraps it as a `*HookAbort` so a host
 can tell a refusal from a fault.
 
+## The change feed — realtime
+
+There is ONE way anything learns that a document changed, and it works for every
+DocType including ones defined at runtime. Every committed write appends one row
+to `fw_changes` **inside the same transaction as the write**, so a change row
+exists if and only if the write landed.
+
+```go
+cursor, _ := e.ChangeCursor(ctx, caller)          // "from now on"
+feed, _  := e.Changes(ctx, caller, framework.ChangesQuery{
+    Since:   cursor,
+    Modules: []string{"help"},                    // or DocTypes: []string{"HD Ticket"}
+})
+for _, c := range feed.Changes {
+    // c = {Seq, DocType, Module, Name, Action, DocStatus, At}
+}
+cursor = feed.Cursor
+```
+
+A `Change` is a FACT and carries **no payload**. A subscriber that cares reads
+the document back through the ordinary permission-checked `GetDocument`, so the
+feed never becomes a second, weaker read path.
+
+| Property | How |
+|----------|-----|
+| Ordered | `seq` is one `AUTOINCREMENT` over the whole table — a total order in commit order |
+| Resumable | ask for `> Cursor`; `sqlite_sequence` keeps the high-water so seq never repeats after a trim |
+| Scoped | the caller's validated `Org`, then the DocTypes that caller may `read` (the same `doctype.Grants` calculus) |
+| Live filters | the visible set is recomputed per page, so a new DocType or a new role grant lands on the next page, not the next reconnect |
+| Honest gaps | a cursor behind `Retention` (24h) gets `ChangeFeed.Reset` — never a silent gap |
+| Bounded | trimmed by age at most once per minute, not once per append |
+
+`Cursor` advances past rows the caller could not see, so a subscriber to a quiet
+DocType in a busy org does not rescan the same range forever.
+
+**Fan-out is the log, not a message.** Any process holding this database serves
+any subscriber by reading rows `> cursor`. `WatchChanges()` returns a coalescing
+wake channel that fires after a commit **in this process** — it removes latency,
+never adds delivery. A subscriber elsewhere still sees every change on its next
+read, so correctness never depends on a message reaching anybody and there is no
+bus to run.
+
+## Presence
+
+Presence is not a second mechanism. `Announce`/`Depart` write a TTL row to
+`fw_presence` (shared store, so every replica sees the whole room) and append a
+`present`/`away` change **to the same feed**, naming the watched document. A
+subscriber already tailing that DocType learns with no new subscription — and,
+because the feed filters on read rights, cannot learn who is looking at
+something it may not read. A refresh of an existing presence appends nothing, so
+a busy room is silent. A viewer that crashes is forgotten when its lease lapses.
+
+The change row carries no roster — `Present(ctx, caller, doctype, name)` does.
+Same rule as documents: the feed says WHAT changed, the client re-reads the value.
+
 ## Known scope boundaries
 
 - Schema changes (`ReplaceDocType`) do not retro-validate existing documents.
@@ -151,6 +208,9 @@ can tell a refusal from a fault.
   write — deliberate, to avoid the single-connection deadlock.
 - Numeric field values must arrive as `float64` or string (the JSON shape). An
   in-process caller passing a Go `int` for a Float/Currency field is rejected.
+- A `Change` records WHAT changed, not WHO changed it. Threading the actor would
+  mean passing `Access` (not just `org`) through five public `Store` methods that
+  hooks also call; the actor is instead a document field a lane defines.
 
 ## Compatibility
 
