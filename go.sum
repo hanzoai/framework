@@ -23,6 +23,8 @@ github.com/grandcat/zeroconf v1.0.0 h1:uHhahLBKqwWBV6WZUDAT71044vwOTL+McW0mBJvo6
 github.com/grandcat/zeroconf v1.0.0/go.mod h1:lTKmG1zh86XyCoUeIHSA4FJMBwCJiQmGfcP2PdzytEs=
 github.com/hanzoai/csqlite v0.1.0 h1:suwC3dh0INlfP/U0Es6cDf6JNQ+2+GVLLATPWCUux6k=
 github.com/hanzoai/csqlite v0.1.0/go.mod h1:H31a/O6VXuklR9UBkgY++bmAK5uzVfXPqU0F6P9Wsos=
+github.com/hanzoai/doctype v0.1.0 h1:xDj9a8jR2VFYw/IonSu2q1NerxscFSC6+DruywuSuDw=
+github.com/hanzoai/doctype v0.1.0/go.mod h1:DmN5to9CcSI0a1PvSeowD70UgFPzsT80BFPKWlrU3Oc=
 github.com/hanzoai/sqlcipher v0.1.1 h1:GARjSiUEa1lwhd1/f87XRaujZBG5s1ZwxrZW2Es/ADI=
 github.com/hanzoai/sqlcipher v0.1.1/go.mod h1:F0soUYM1i4sawOZUpRvVnWoUayPbeGVlGq01VXy9Aqg=
 github.com/hanzoai/sqlite v0.4.0 h1:xlF6w6xzn2VSeAVBKFrZfIq0ISqRSTHz2g3QN3eCcnE=
