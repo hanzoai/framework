@@ -306,11 +306,10 @@ func (s *Store) trim(ctx context.Context) {
 	s.lastTrim = time.Now()
 	s.watchMu.Unlock()
 	cutoff := time.Now().Add(-Retention).Unix()
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM fw_changes WHERE at < ?`, cutoff); err != nil {
-		// Retention is housekeeping: a failure must never fail the write that
-		// already landed. The next tick tries again.
-		return
-	}
+	// Retention is housekeeping: a failure must never fail the write that already
+	// landed, so both sweeps ignore their errors and the next tick tries again.
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM fw_changes WHERE at < ?`, cutoff)
+	s.sweepPresence(ctx)
 }
 
 // changes reads one page of the org's log restricted to dtNames.

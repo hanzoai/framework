@@ -126,6 +126,9 @@ CREATE TABLE IF NOT EXISTS fw_locks (
 	if _, err := s.db.Exec(changesDDL); err != nil {
 		return fmt.Errorf("framework migrate changes: %w", err)
 	}
+	if _, err := s.db.Exec(presenceDDL); err != nil {
+		return fmt.Errorf("framework migrate presence: %w", err)
+	}
 	return nil
 }
 
