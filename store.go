@@ -26,6 +26,10 @@ import (
 // serializes writes against the single-writer SQLite file.
 type Store struct {
 	db *sql.DB
+	// watchState is the change log's in-process bookkeeping (see changes.go):
+	// the wake channels of subscribers sharing this process, and when the log
+	// was last trimmed. Its zero value is ready.
+	watchState
 }
 
 // openStore opens (and migrates) the engine's database. `open` is the host's
@@ -58,9 +62,9 @@ func openStore(path string, open OpenDBFunc) (*Store, error) {
 	return s, nil
 }
 
-// migrate creates the five framework tables. Idempotent (IF NOT EXISTS). Every
-// table leads its primary key with `org` so tenant isolation is a physical
-// property of the schema, not merely a WHERE clause.
+// migrate creates the framework tables. Idempotent (IF NOT EXISTS). Every table
+// carries `org` — leading the primary key where it has one — so tenant isolation
+// is a physical property of the schema, not merely a WHERE clause.
 func (s *Store) migrate() error {
 	const ddl = `
 CREATE TABLE IF NOT EXISTS fw_doctypes (
@@ -116,6 +120,11 @@ CREATE TABLE IF NOT EXISTS fw_locks (
 `
 	if _, err := s.db.Exec(ddl); err != nil {
 		return fmt.Errorf("framework migrate: %w", err)
+	}
+	// The change log's schema lives with the change log (changes.go), so the one
+	// file that owns the feed owns its table too.
+	if _, err := s.db.Exec(changesDDL); err != nil {
+		return fmt.Errorf("framework migrate changes: %w", err)
 	}
 	return nil
 }
@@ -300,43 +309,40 @@ func (s *Store) CreateDocument(ctx context.Context, org string, dt *DocType, dat
 		return err
 	}
 
-	switch {
-	case doctype.IsSeries(dt.Autoname):
+	// Both naming paths run in a transaction so the change-log row (changes.go)
+	// is atomic with the insert it describes: a subscriber can never be told
+	// about a document that failed to land, nor miss one that did.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Document{}, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var name string
+	if doctype.IsSeries(dt.Autoname) {
 		ser := doctype.ExpandSeries(dt.Autoname, time.Now())
-		tx, err := s.db.BeginTx(ctx, nil)
-		if err != nil {
-			return Document{}, fmt.Errorf("begin: %w", err)
-		}
-		defer func() { _ = tx.Rollback() }()
 		n, err := nextSeries(ctx, tx, org, ser.Key)
 		if err != nil {
 			return Document{}, err
 		}
-		name := ser.Format(n)
-		if err := insert(ctx, tx, name); err != nil {
-			if isUnique(err) {
-				return Document{}, ErrConflict
-			}
-			return Document{}, fmt.Errorf("insert document: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return Document{}, fmt.Errorf("commit: %w", err)
-		}
-		return Document{Name: name, DocType: dt.Name, Data: data, CreatedAt: now, UpdatedAt: now}, nil
-
-	default:
-		name, err := doctype.ResolveName(dt, data, requestedName)
-		if err != nil {
-			return Document{}, err
-		}
-		if err := insert(ctx, s.db, name); err != nil {
-			if isUnique(err) {
-				return Document{}, ErrConflict
-			}
-			return Document{}, fmt.Errorf("insert document: %w", err)
-		}
-		return Document{Name: name, DocType: dt.Name, Data: data, CreatedAt: now, UpdatedAt: now}, nil
+		name = ser.Format(n)
+	} else if name, err = doctype.ResolveName(dt, data, requestedName); err != nil {
+		return Document{}, err
 	}
+	if err := insert(ctx, tx, name); err != nil {
+		if isUnique(err) {
+			return Document{}, ErrConflict
+		}
+		return Document{}, fmt.Errorf("insert document: %w", err)
+	}
+	if err := s.appendChange(ctx, tx, org, dt.Name, name, ChangeCreated, 0); err != nil {
+		return Document{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Document{}, fmt.Errorf("commit: %w", err)
+	}
+	s.committed(ctx)
+	return Document{Name: name, DocType: dt.Name, Data: data, CreatedAt: now, UpdatedAt: now}, nil
 }
 
 // UpsertSingle writes THE single document of a Single DocType (name == doctype
@@ -347,13 +353,26 @@ func (s *Store) UpsertSingle(ctx context.Context, org string, dt *DocType, data 
 	if err != nil {
 		return Document{}, fmt.Errorf("marshal data: %w", err)
 	}
-	_, err = s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Document{}, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err = tx.ExecContext(ctx,
 		`INSERT INTO fw_documents (org,doctype,name,docstatus,data,created_at,updated_at) VALUES (?,?,?,0,?,?,?)
 		 ON CONFLICT(org,doctype,name) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at`,
-		org, dt.Name, dt.Name, string(blob), now, now)
-	if err != nil {
+		org, dt.Name, dt.Name, string(blob), now, now); err != nil {
 		return Document{}, fmt.Errorf("upsert single: %w", err)
 	}
+	// A Single's create and update are the same write, so the feed reports the
+	// same action for both: a subscriber re-reads the one document either way.
+	if err := s.appendChange(ctx, tx, org, dt.Name, dt.Name, ChangeUpdated, 0); err != nil {
+		return Document{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Document{}, fmt.Errorf("commit: %w", err)
+	}
+	s.committed(ctx)
 	return s.GetDocument(ctx, org, dt.Name, dt.Name)
 }
 
@@ -479,9 +498,13 @@ func (s *Store) UpdateDocument(ctx context.Context, org string, dt *DocType, nam
 		string(blob), now, org, dt.Name, name); err != nil {
 		return Document{}, fmt.Errorf("update document: %w", err)
 	}
+	if err := s.appendChange(ctx, tx, org, dt.Name, name, ChangeUpdated, status); err != nil {
+		return Document{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Document{}, fmt.Errorf("commit: %w", err)
 	}
+	s.committed(ctx)
 	return s.GetDocument(ctx, org, dt.Name, name)
 }
 
@@ -512,21 +535,41 @@ func (s *Store) SetDocStatus(ctx context.Context, org, dtName, name string, from
 		to, now, org, dtName, name); err != nil {
 		return Document{}, fmt.Errorf("set docstatus: %w", err)
 	}
+	if err := s.appendChange(ctx, tx, org, dtName, name, docStatusAction(to), to); err != nil {
+		return Document{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Document{}, fmt.Errorf("commit: %w", err)
 	}
+	s.committed(ctx)
 	return s.GetDocument(ctx, org, dtName, name)
 }
 
 // DeleteDocument removes a document by key. Returns false if absent. The service
 // enforces the lifecycle guard (a submitted doc must be cancelled first).
 func (s *Store) DeleteDocument(ctx context.Context, org, dtName, name string) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM fw_documents WHERE org=? AND doctype=? AND name=?`, org, dtName, name)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `DELETE FROM fw_documents WHERE org=? AND doctype=? AND name=?`, org, dtName, name)
 	if err != nil {
 		return false, fmt.Errorf("delete document: %w", err)
 	}
 	n, _ := res.RowsAffected()
-	return n > 0, nil
+	if n == 0 {
+		// Nothing was removed, so nothing changed: no change row, no wake.
+		return false, nil
+	}
+	if err := s.appendChange(ctx, tx, org, dtName, name, ChangeDeleted, 0); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	s.committed(ctx)
+	return true, nil
 }
 
 // CountDocuments returns the org's document count for a doctype (real, per-org).
