@@ -155,3 +155,27 @@ can tell a refusal from a fault.
 ## Compatibility
 
 Go module rules apply: this stays at `v0.x`/`v1.x` forever. Never `v2`.
+
+## Provenance
+
+Original Hanzo work. This engine rebuilds Frappe's DocType **concept** in Go
+from its documented behaviour — the metadata model, the `docstatus` lifecycle,
+the autoname grammar, the role/perm vocabulary. No Frappe code was copied,
+ported or translated, and nothing in the dependency graph derives from Frappe.
+The negative fingerprints are cheap to re-check: tables are `fw_*` where
+Frappe's are `tab*`; our `DocField` carries 11 properties against the 80 in
+Frappe's `docfield.json`; and the ones we do share are spelled camelCase
+(`inListView`, `fetchFrom`, `readOnly`) where Frappe writes `in_list_view`,
+`fetch_from`, `read_only` — a translated port would have carried the
+snake_case through. No Frappe error string or column name appears anywhere in
+the tree.
+
+What IS shared is interface, on purpose: `INV-.YYYY.-.#####` and `System
+Manager` mean here what they mean there, so anyone who knows Frappe can read
+this schema. A shared vocabulary is not shared code.
+
+Apache 2.0 is therefore Hanzo's own grant over its own new code, inherited from
+no one. `NOTICE` exists because we author it — §4(d) obliges a NOTICE only where
+an upstream work shipped one, and there is no upstream. **Do not add Frappe
+attribution here**: Frappe is MIT, but we took none of its code, and claiming
+otherwise would misstate the provenance.
