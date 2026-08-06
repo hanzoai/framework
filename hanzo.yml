@@ -1,0 +1,18 @@
+# Canonical CI/CD config for hanzoai/framework — the one file both the hanzoai/ci
+# reusable (.hanzo/workflows/cicd.yml) and platform.hanzo.ai read.
+#
+# A Go module (the doctype engine: ingest, hooks, locks, ops, permissions,
+# store). It ships from a tag and builds no image, so there is no `images:` and
+# no `deploy:` — only a gate.
+#
+# `-race` matters here specifically: the lock and always-on-isolation suites are
+# about what happens when two callers touch the same lease at once, and the
+# red-lease-final test is the assertion that the loser loses. Without the race
+# detector those pass while racing. `-count=1` so nothing comes from the cache.
+test:
+  - name: build
+    run: |
+      set -e
+      go build ./...
+      go vet ./...
+      go test -race -count=1 ./...
