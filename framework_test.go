@@ -449,3 +449,36 @@ func itoa(n int) string {
 	}
 	return string(b[i:])
 }
+
+// TestSeedOwnerNeedsAName. The owner seed is ONE-SHOT per org: the first role
+// assignment claims it and every later caller falls through to "System Manager
+// role required". So a row keyed to a name nobody holds does not just fail to
+// help anyone — it takes the claim permanently, and it cannot be undone, because
+// revoking a role takes the very role that row absorbed.
+//
+// The pair is what makes the row mean something: the same call with a real name
+// must seed, or the refusal above would pass against a store that seeds nothing.
+func TestSeedOwnerNeedsAName(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct{ name, org, user string }{
+		{"no user", "acme", ""},
+		{"blank user", "acme", "   "},
+		{"no org", "", "u-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testStore(t)
+			ok, err := s.SeedOwnerIfUnowned(ctx, tc.org, tc.user)
+			if err == nil {
+				t.Fatalf("seeded %q/%q without a name (ok=%v) — the org's one claim is gone", tc.org, tc.user, ok)
+			}
+			if ok {
+				t.Fatalf("refused and seeded anyway: %v", err)
+			}
+			// The org must still be claimable by a real person.
+			seeded, err := s.SeedOwnerIfUnowned(ctx, "acme", "u-real")
+			if err != nil || !seeded {
+				t.Fatalf("after the refusal the org must still be unowned: seeded=%v err=%v", seeded, err)
+			}
+		})
+	}
+}

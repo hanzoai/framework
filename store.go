@@ -654,7 +654,17 @@ func (s *Store) AssignRole(ctx context.Context, org, user, role string) error {
 // Manager (Red measured 3–6). A UNIQUE index is deliberately NOT used: multiple SMs
 // are legitimate later, granted explicitly via AssignRole — only the AUTOMATIC
 // first-seed must be singular.
+//
+// BOTH NAMES ARE REQUIRED, and the user for the same reason [Engine.AssignRole]
+// requires it: a role belongs to somebody. The seed is one-shot per org, so a row
+// keyed to a name nobody holds absorbs it permanently — no later caller can be
+// seeded, and no caller can revoke it either, because revoking takes the very
+// role that row holds. Refusing here means an unowned org stays claimable.
 func (s *Store) SeedOwnerIfUnowned(ctx context.Context, org, user string) (bool, error) {
+	org, user = strings.TrimSpace(org), strings.TrimSpace(user)
+	if org == "" || user == "" {
+		return false, doctype.Errorf("org and user are required to seed an owner")
+	}
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO fw_roles (org, usr, role)
 		 SELECT ?, ?, ?
