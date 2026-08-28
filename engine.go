@@ -57,6 +57,10 @@ type Caller struct {
 	// IsAdmin marks a PLATFORM superuser (not an org admin): a manager in every
 	// org. The host sets it only for a verified platform-level identity.
 	IsAdmin bool
+	// Roles is the caller's effective role set in Org, resolved by the host from
+	// Hanzo IAM. The engine stores no roles: identity, membership and grants are
+	// IAM's, and a second copy here is a second answer to who may do what.
+	Roles []string
 }
 
 // Config configures an Engine.

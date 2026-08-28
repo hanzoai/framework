@@ -27,9 +27,16 @@ func testEngine(t *testing.T) *Engine {
 
 // owner is the first caller in an org — trust-on-first-use makes it the System
 // Manager the moment it performs a manager operation.
-func owner(org string) Caller  { return Caller{Org: org, User: "owner@" + org} }
+func owner(org string) Caller {
+	return Caller{Org: org, User: "owner@" + org, Roles: []string{RoleSystemManager}}
+}
 func member(org string) Caller { return Caller{Org: org, User: "member@" + org} }
 func admin() Caller            { return Caller{Org: "any", User: "root", IsAdmin: true} }
+
+// as builds a caller IAM has put in the named roles.
+func as(org, user string, roles ...string) Caller {
+	return Caller{Org: org, User: user, Roles: roles}
+}
 
 func invoiceDT() DocType {
 	return DocType{
@@ -93,11 +100,8 @@ func TestOps_OwnerSeededOnce(t *testing.T) {
 	}); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("a later member defined a DocType: %v", err)
 	}
-	// ...until the owner grants them the role.
-	if _, err := e.AssignRole(ctx, owner("acme"), "member@acme", RoleSystemManager); err != nil {
-		t.Fatalf("AssignRole: %v", err)
-	}
-	if _, err := e.DefineDocType(ctx, member("acme"), DocType{
+	// ...until IAM puts them in the role.
+	if _, err := e.DefineDocType(ctx, as("acme", "member@acme", RoleSystemManager), DocType{
 		Name: "Other", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}},
 	}); err != nil {
 		t.Fatalf("granted member still denied: %v", err)
@@ -111,10 +115,7 @@ func TestOps_PermsEnforcedPerRight(t *testing.T) {
 	ctx := context.Background()
 	seed(t, e, "acme", invoiceDT())
 
-	clerk := Caller{Org: "acme", User: "clerk@acme"}
-	if _, err := e.AssignRole(ctx, owner("acme"), "clerk@acme", "Clerk"); err != nil {
-		t.Fatalf("AssignRole: %v", err)
-	}
+	clerk := as("acme", "clerk@acme", "Clerk")
 
 	doc, err := e.CreateDocument(ctx, clerk, "Sales Invoice", map[string]any{"customer": "Widgets Ltd"})
 	if err != nil {
@@ -428,34 +429,9 @@ func TestOps_InvalidSchemaRefused(t *testing.T) {
 	}
 }
 
-// ---- roles ----
-
-func TestOps_Roles(t *testing.T) {
-	e := testEngine(t)
-	ctx := context.Background()
-	c := owner("acme")
-	seed(t, e, "acme", invoiceDT()) // seeds the owner
-
-	if _, err := e.AssignRole(ctx, c, "  ", "Clerk"); Classify(err) != CodeInvalid {
-		t.Fatalf("empty user = %v, want CodeInvalid", err)
-	}
-	if _, err := e.AssignRole(ctx, c, strings.Repeat("u", doctype.MaxNameLen+1), "Clerk"); Classify(err) != CodeInvalid {
-		t.Fatalf("over-long user = %v, want CodeInvalid", err)
-	}
-	if _, err := e.AssignRole(ctx, c, "clerk@acme", "Clerk"); err != nil {
-		t.Fatalf("assign: %v", err)
-	}
-	roles, err := e.ListRoles(ctx, c)
-	if err != nil || len(roles) != 2 { // owner + clerk
-		t.Fatalf("ListRoles = %v (%d), %v", roles, len(roles), err)
-	}
-	if err := e.RevokeRole(ctx, c, "clerk@acme", "Clerk"); err != nil {
-		t.Fatalf("revoke: %v", err)
-	}
-	if err := e.RevokeRole(ctx, c, "clerk@acme", "Clerk"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("second revoke = %v, want ErrNotFound", err)
-	}
-}
+// Roles are IAM's. The engine reads them off the Caller and stores none, so what
+// remains to test here is that a role the caller carries actually grants — which
+// TestOps_PermsEnforcedPerRight and TestOps_ManagerGate already do.
 
 // ---- modules ----
 

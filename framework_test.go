@@ -5,8 +5,6 @@ import (
 	"github.com/hanzoai/doctype"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -378,56 +376,7 @@ func TestHooks(t *testing.T) {
 	}
 }
 
-// TestAtomicOwnerSeed proves the owner seed is singular under concurrency: N
-// simultaneous role-less first-callers on a fresh org yield EXACTLY ONE seeded
-// System Manager. The prior check-then-insert seeded 3–6 (the Red LOW); the
-// single conditional INSERT (SeedOwnerIfUnowned) makes "exactly one" true.
-func TestAtomicOwnerSeed(t *testing.T) {
-	s := testStore(t)
-	ctx := context.Background()
-	const org = "acme"
-	const n = 8
-
-	var (
-		wg          sync.WaitGroup
-		seededCount int32
-	)
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go func(i int) {
-			defer wg.Done()
-			ok, err := s.SeedOwnerIfUnowned(ctx, org, "user"+itoa(i))
-			if err != nil {
-				t.Errorf("seed %d: %v", i, err)
-				return
-			}
-			if ok {
-				atomic.AddInt32(&seededCount, 1)
-			}
-		}(i)
-	}
-	wg.Wait()
-
-	if seededCount != 1 {
-		t.Fatalf("want exactly 1 caller to win the seed, got %d", seededCount)
-	}
-	roles, err := s.ListRoles(ctx, org)
-	if err != nil {
-		t.Fatalf("list roles: %v", err)
-	}
-	sm := 0
-	for _, r := range roles {
-		if r.Role == RoleSystemManager {
-			sm++
-		}
-	}
-	if sm != 1 {
-		t.Fatalf("want exactly 1 System Manager row, got %d (%+v)", sm, roles)
-	}
-}
-
 func ptr(dt DocType) *DocType { return &dt }
-
 func itoa(n int) string {
 	if n == 0 {
 		return "0"
@@ -448,37 +397,4 @@ func itoa(n int) string {
 		b[i] = '-'
 	}
 	return string(b[i:])
-}
-
-// TestSeedOwnerNeedsAName. The owner seed is ONE-SHOT per org: the first role
-// assignment claims it and every later caller falls through to "System Manager
-// role required". So a row keyed to a name nobody holds does not just fail to
-// help anyone — it takes the claim permanently, and it cannot be undone, because
-// revoking a role takes the very role that row absorbed.
-//
-// The pair is what makes the row mean something: the same call with a real name
-// must seed, or the refusal above would pass against a store that seeds nothing.
-func TestSeedOwnerNeedsAName(t *testing.T) {
-	ctx := context.Background()
-	for _, tc := range []struct{ name, org, user string }{
-		{"no user", "acme", ""},
-		{"blank user", "acme", "   "},
-		{"no org", "", "u-1"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s := testStore(t)
-			ok, err := s.SeedOwnerIfUnowned(ctx, tc.org, tc.user)
-			if err == nil {
-				t.Fatalf("seeded %q/%q without a name (ok=%v) — the org's one claim is gone", tc.org, tc.user, ok)
-			}
-			if ok {
-				t.Fatalf("refused and seeded anyway: %v", err)
-			}
-			// The org must still be claimable by a real person.
-			seeded, err := s.SeedOwnerIfUnowned(ctx, "acme", "u-real")
-			if err != nil || !seeded {
-				t.Fatalf("after the refusal the org must still be unowned: seeded=%v err=%v", seeded, err)
-			}
-		})
-	}
 }

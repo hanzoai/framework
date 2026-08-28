@@ -141,61 +141,6 @@ func (e *Engine) DeleteDocType(ctx context.Context, c Caller, name string) error
 	return nil
 }
 
-// ---- Roles ----
-
-// ListRoles returns the org's (user, role) assignments.
-func (e *Engine) ListRoles(ctx context.Context, c Caller) ([]Role, error) {
-	if err := e.ready(); err != nil {
-		return nil, err
-	}
-	acc, err := e.resolve(ctx, c)
-	if err != nil {
-		return nil, err
-	}
-	return e.store.ListRoles(ctx, acc.Org)
-}
-
-// AssignRole grants (user, role) in the caller's org. Manager-only.
-func (e *Engine) AssignRole(ctx context.Context, c Caller, user, role string) (Role, error) {
-	if err := e.ready(); err != nil {
-		return Role{}, err
-	}
-	acc, err := e.resolveManager(ctx, c)
-	if err != nil {
-		return Role{}, err
-	}
-	user, role = strings.TrimSpace(user), strings.TrimSpace(role)
-	if user == "" || role == "" {
-		return Role{}, doctype.Errorf("user and role are required")
-	}
-	if len(user) > doctype.MaxNameLen || len(role) > doctype.MaxNameLen {
-		return Role{}, doctype.Errorf("user or role too long")
-	}
-	if err := e.store.AssignRole(ctx, acc.Org, user, role); err != nil {
-		return Role{}, err
-	}
-	return Role{User: user, Role: role}, nil
-}
-
-// RevokeRole removes (user, role) in the caller's org. Manager-only.
-func (e *Engine) RevokeRole(ctx context.Context, c Caller, user, role string) error {
-	if err := e.ready(); err != nil {
-		return err
-	}
-	acc, err := e.resolveManager(ctx, c)
-	if err != nil {
-		return err
-	}
-	revoked, err := e.store.RevokeRole(ctx, acc.Org, user, role)
-	if err != nil {
-		return err
-	}
-	if !revoked {
-		return ErrNotFound
-	}
-	return nil
-}
-
 // ---- Modules (app-lane fixtures) ----
 
 // Modules lists the app lanes compiled into this binary and the DocTypes each

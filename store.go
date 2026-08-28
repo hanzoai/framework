@@ -98,14 +98,6 @@ CREATE TABLE IF NOT EXISTS fw_series (
   PRIMARY KEY (org, series)
 );
 
-CREATE TABLE IF NOT EXISTS fw_roles (
-  org  TEXT NOT NULL,
-  usr  TEXT NOT NULL,
-  role TEXT NOT NULL,
-  PRIMARY KEY (org, usr, role)
-);
-CREATE INDEX IF NOT EXISTS ix_fw_roles_org ON fw_roles(org);
-
 CREATE TABLE IF NOT EXISTS fw_locks (
   org        TEXT NOT NULL,
   lockkey    TEXT NOT NULL,
@@ -609,100 +601,6 @@ func nextSeries(ctx context.Context, tx *sql.Tx, org, key string) (int64, error)
 }
 
 // ---- Roles (per-org assignments) ----
-
-// Role is a (user, role) assignment within an org.
-type Role struct {
-	User string `json:"user"`
-	Role string `json:"role"`
-}
-
-func (s *Store) ListRoles(ctx context.Context, org string) ([]Role, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT usr, role FROM fw_roles WHERE org=? ORDER BY usr, role`, org)
-	if err != nil {
-		return nil, fmt.Errorf("list roles: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	out := make([]Role, 0, 16)
-	for rows.Next() {
-		var r Role
-		if err := rows.Scan(&r.User, &r.Role); err != nil {
-			return nil, fmt.Errorf("scan role: %w", err)
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) AssignRole(ctx context.Context, org, user, role string) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO fw_roles (org,usr,role) VALUES (?,?,?) ON CONFLICT(org,usr,role) DO NOTHING`, org, user, role)
-	if err != nil {
-		return fmt.Errorf("assign role: %w", err)
-	}
-	return nil
-}
-
-// SeedOwnerIfUnowned atomically grants `user` the System Manager role IFF the org
-// has NO role assignment yet — the trust-on-first-use owner seed. It is a SINGLE
-// conditional INSERT (INSERT ... SELECT ... WHERE NOT EXISTS), so the "is the org
-// unowned?" test and the insert are one statement: under concurrency EXACTLY ONE
-// caller's row lands (the rest match an org that now has a role and insert
-// nothing). Returns whether THIS caller became the seeded owner (RowsAffected==1).
-//
-// This replaces a check-then-insert (a SELECT for existing roles, then an INSERT)
-// whose window let several simultaneous first-callers each seed themselves System
-// Manager (Red measured 3–6). A UNIQUE index is deliberately NOT used: multiple SMs
-// are legitimate later, granted explicitly via AssignRole — only the AUTOMATIC
-// first-seed must be singular.
-//
-// BOTH NAMES ARE REQUIRED, and the user for the same reason [Engine.AssignRole]
-// requires it: a role belongs to somebody. The seed is one-shot per org, so a row
-// keyed to a name nobody holds absorbs it permanently — no later caller can be
-// seeded, and no caller can revoke it either, because revoking takes the very
-// role that row holds. Refusing here means an unowned org stays claimable.
-func (s *Store) SeedOwnerIfUnowned(ctx context.Context, org, user string) (bool, error) {
-	org, user = strings.TrimSpace(org), strings.TrimSpace(user)
-	if org == "" || user == "" {
-		return false, doctype.Errorf("org and user are required to seed an owner")
-	}
-	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO fw_roles (org, usr, role)
-		 SELECT ?, ?, ?
-		 WHERE NOT EXISTS (SELECT 1 FROM fw_roles WHERE org = ?)`,
-		org, user, doctype.RoleSystemManager, org)
-	if err != nil {
-		return false, fmt.Errorf("seed owner: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	return n == 1, nil
-}
-
-func (s *Store) RevokeRole(ctx context.Context, org, user, role string) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM fw_roles WHERE org=? AND usr=? AND role=?`, org, user, role)
-	if err != nil {
-		return false, fmt.Errorf("revoke role: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
-}
-
-// RolesFor returns the roles assigned to a user in an org.
-func (s *Store) RolesFor(ctx context.Context, org, user string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT role FROM fw_roles WHERE org=? AND usr=?`, org, user)
-	if err != nil {
-		return nil, fmt.Errorf("roles for: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	var out []string
-	for rows.Next() {
-		var r string
-		if err := rows.Scan(&r); err != nil {
-			return nil, fmt.Errorf("scan role: %w", err)
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
 
 // ---- small helpers ----
 
