@@ -38,9 +38,13 @@ func as(org, user string, roles ...string) Caller {
 	return Caller{Org: org, User: user, Roles: roles}
 }
 
+// at is a DocType's address. Every operation names a DocType by the pair, so the
+// tests spell the pair one way, here.
+func at(module, name string) doctype.ID { return doctype.ID{Module: module, Name: name} }
+
 func invoiceDT() DocType {
 	return DocType{
-		Name: "Sales Invoice", IsSubmittable: true, TitleField: "customer",
+		Name: "Sales Invoice", Module: "erp", IsSubmittable: true, TitleField: "customer",
 		Fields: []DocField{
 			{Fieldname: "customer", Fieldtype: FieldData, Reqd: true},
 			{Fieldname: "total", Fieldtype: FieldCurrency},
@@ -77,7 +81,7 @@ func TestOps_NoTenantRefused(t *testing.T) {
 	if _, err := e.DefineDocType(ctx, none, invoiceDT()); !errors.Is(err, ErrForbidden) {
 		t.Errorf("DefineDocType with no org = %v, want ErrForbidden", err)
 	}
-	if _, err := e.CreateDocument(ctx, none, "Sales Invoice", nil); !errors.Is(err, ErrForbidden) {
+	if _, err := e.CreateDocument(ctx, none, at("erp", "Sales Invoice"), nil); !errors.Is(err, ErrForbidden) {
 		t.Errorf("CreateDocument with no org = %v, want ErrForbidden", err)
 	}
 	if Classify(errors.New("x")) == CodeForbidden {
@@ -96,13 +100,13 @@ func TestOps_OwnerSeededOnce(t *testing.T) {
 
 	// A second, different member is NOT a manager.
 	if _, err := e.DefineDocType(ctx, member("acme"), DocType{
-		Name: "Other", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}},
+		Name: "Other", Module: "erp", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}},
 	}); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("a later member defined a DocType: %v", err)
 	}
 	// ...until IAM puts them in the role.
 	if _, err := e.DefineDocType(ctx, as("acme", "member@acme", RoleSystemManager), DocType{
-		Name: "Other", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}},
+		Name: "Other", Module: "erp", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}},
 	}); err != nil {
 		t.Fatalf("granted member still denied: %v", err)
 	}
@@ -117,11 +121,11 @@ func TestOps_PermsEnforcedPerRight(t *testing.T) {
 
 	clerk := as("acme", "clerk@acme", "Clerk")
 
-	doc, err := e.CreateDocument(ctx, clerk, "Sales Invoice", map[string]any{"customer": "Widgets Ltd"})
+	doc, err := e.CreateDocument(ctx, clerk, at("erp", "Sales Invoice"), map[string]any{"customer": "Widgets Ltd"})
 	if err != nil {
 		t.Fatalf("Clerk create denied: %v", err)
 	}
-	if _, err := e.GetDocument(ctx, clerk, "Sales Invoice", doc.Name); err != nil {
+	if _, err := e.GetDocument(ctx, clerk, at("erp", "Sales Invoice"), doc.Name); err != nil {
 		t.Fatalf("Clerk read denied: %v", err)
 	}
 	for _, tc := range []struct {
@@ -129,11 +133,11 @@ func TestOps_PermsEnforcedPerRight(t *testing.T) {
 		call func() error
 	}{
 		{"write", func() error {
-			_, err := e.UpdateDocument(ctx, clerk, "Sales Invoice", doc.Name, map[string]any{"customer": "X"})
+			_, err := e.UpdateDocument(ctx, clerk, at("erp", "Sales Invoice"), doc.Name, map[string]any{"customer": "X"})
 			return err
 		}},
-		{"submit", func() error { _, err := e.Submit(ctx, clerk, "Sales Invoice", doc.Name); return err }},
-		{"delete", func() error { return e.DeleteDocument(ctx, clerk, "Sales Invoice", doc.Name) }},
+		{"submit", func() error { _, err := e.Submit(ctx, clerk, at("erp", "Sales Invoice"), doc.Name); return err }},
+		{"delete", func() error { return e.DeleteDocument(ctx, clerk, at("erp", "Sales Invoice"), doc.Name) }},
 	} {
 		if err := tc.call(); !errors.Is(err, ErrForbidden) {
 			t.Errorf("Clerk %s = %v, want ErrForbidden", tc.name, err)
@@ -148,10 +152,10 @@ func TestOps_RoleLessMemberDenied(t *testing.T) {
 	seed(t, e, "acme", invoiceDT())
 
 	stranger := Caller{Org: "acme", User: "stranger@acme"}
-	if _, err := e.CreateDocument(ctx, stranger, "Sales Invoice", map[string]any{"customer": "X"}); !errors.Is(err, ErrForbidden) {
+	if _, err := e.CreateDocument(ctx, stranger, at("erp", "Sales Invoice"), map[string]any{"customer": "X"}); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("role-less member created a document: %v", err)
 	}
-	if _, err := e.ListDocuments(ctx, stranger, "Sales Invoice", ListOpts{}); !errors.Is(err, ErrForbidden) {
+	if _, err := e.ListDocuments(ctx, stranger, at("erp", "Sales Invoice"), ListOpts{}); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("role-less member listed documents: %v", err)
 	}
 }
@@ -165,7 +169,7 @@ func TestOps_SuperAdmin(t *testing.T) {
 	if _, err := e.DefineDocType(ctx, root, invoiceDT()); err != nil {
 		t.Fatalf("superadmin denied: %v", err)
 	}
-	if _, err := e.CreateDocument(ctx, root, "Sales Invoice", map[string]any{"customer": "X"}); err != nil {
+	if _, err := e.CreateDocument(ctx, root, at("erp", "Sales Invoice"), map[string]any{"customer": "X"}); err != nil {
 		t.Fatalf("superadmin document create denied: %v", err)
 	}
 }
@@ -179,12 +183,12 @@ func TestOps_TenantIsolation(t *testing.T) {
 	ctx := context.Background()
 	seed(t, e, "orgA", invoiceDT())
 
-	doc, err := e.CreateDocument(ctx, owner("orgA"), "Sales Invoice", map[string]any{"customer": "Secret Co"})
+	doc, err := e.CreateDocument(ctx, owner("orgA"), at("erp", "Sales Invoice"), map[string]any{"customer": "Secret Co"})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	// orgB does not even have the DocType.
-	if _, err := e.GetDocument(ctx, owner("orgB"), "Sales Invoice", doc.Name); !errors.Is(err, ErrNotFound) {
+	if _, err := e.GetDocument(ctx, owner("orgB"), at("erp", "Sales Invoice"), doc.Name); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-tenant read = %v, want ErrNotFound", err)
 	}
 	dts, err := e.ListDocTypes(ctx, owner("orgB"))
@@ -192,7 +196,7 @@ func TestOps_TenantIsolation(t *testing.T) {
 		t.Fatalf("ListDocTypes: %v", err)
 	}
 	for _, dt := range dts {
-		if dt.Name == "Sales Invoice" {
+		if dt.ID() == at("erp", "Sales Invoice") {
 			t.Fatal("orgB sees orgA's DocType")
 		}
 	}
@@ -206,46 +210,46 @@ func TestOps_DocumentCRUDAndLifecycle(t *testing.T) {
 	c := owner("acme")
 	seed(t, e, "acme", invoiceDT())
 
-	doc, err := e.CreateDocument(ctx, c, "Sales Invoice", map[string]any{"customer": "Widgets Ltd", "total": 10.5})
+	doc, err := e.CreateDocument(ctx, c, at("erp", "Sales Invoice"), map[string]any{"customer": "Widgets Ltd", "total": 10.5})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if doc.Meta == nil || doc.Meta.Name != "Sales Invoice" {
+	if doc.Meta == nil || doc.Meta.ID() != at("erp", "Sales Invoice") {
 		t.Fatal("returned Doc carries no schema")
 	}
 
-	got, err := e.GetDocument(ctx, c, "Sales Invoice", doc.Name)
+	got, err := e.GetDocument(ctx, c, at("erp", "Sales Invoice"), doc.Name)
 	if err != nil || got.Data["customer"] != "Widgets Ltd" {
 		t.Fatalf("get = %+v, %v", got.Data, err)
 	}
 
-	if _, err := e.UpdateDocument(ctx, c, "Sales Invoice", doc.Name, map[string]any{"customer": "Gadgets Ltd"}); err != nil {
+	if _, err := e.UpdateDocument(ctx, c, at("erp", "Sales Invoice"), doc.Name, map[string]any{"customer": "Gadgets Ltd"}); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 
 	// submit → immutable
-	sub, err := e.Submit(ctx, c, "Sales Invoice", doc.Name)
+	sub, err := e.Submit(ctx, c, at("erp", "Sales Invoice"), doc.Name)
 	if err != nil || sub.DocStatus != 1 {
 		t.Fatalf("submit = %+v, %v", sub, err)
 	}
-	if _, err := e.UpdateDocument(ctx, c, "Sales Invoice", doc.Name, map[string]any{"customer": "Z"}); !errors.Is(err, ErrBadState) {
+	if _, err := e.UpdateDocument(ctx, c, at("erp", "Sales Invoice"), doc.Name, map[string]any{"customer": "Z"}); !errors.Is(err, ErrBadState) {
 		t.Fatalf("submitted document was editable: %v", err)
 	}
-	if err := e.DeleteDocument(ctx, c, "Sales Invoice", doc.Name); !errors.Is(err, ErrBadState) {
+	if err := e.DeleteDocument(ctx, c, at("erp", "Sales Invoice"), doc.Name); !errors.Is(err, ErrBadState) {
 		t.Fatalf("submitted document was deletable: %v", err)
 	}
 	// double submit refused
-	if _, err := e.Submit(ctx, c, "Sales Invoice", doc.Name); !errors.Is(err, ErrBadState) {
+	if _, err := e.Submit(ctx, c, at("erp", "Sales Invoice"), doc.Name); !errors.Is(err, ErrBadState) {
 		t.Fatalf("double submit = %v, want ErrBadState", err)
 	}
 	// cancel → deletable
-	if _, err := e.Cancel(ctx, c, "Sales Invoice", doc.Name); err != nil {
+	if _, err := e.Cancel(ctx, c, at("erp", "Sales Invoice"), doc.Name); err != nil {
 		t.Fatalf("cancel: %v", err)
 	}
-	if err := e.DeleteDocument(ctx, c, "Sales Invoice", doc.Name); err != nil {
+	if err := e.DeleteDocument(ctx, c, at("erp", "Sales Invoice"), doc.Name); err != nil {
 		t.Fatalf("delete after cancel: %v", err)
 	}
-	if _, err := e.GetDocument(ctx, c, "Sales Invoice", doc.Name); !errors.Is(err, ErrNotFound) {
+	if _, err := e.GetDocument(ctx, c, at("erp", "Sales Invoice"), doc.Name); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("deleted document still readable: %v", err)
 	}
 }
@@ -255,12 +259,12 @@ func TestOps_NotSubmittable(t *testing.T) {
 	e := testEngine(t)
 	ctx := context.Background()
 	c := owner("acme")
-	seed(t, e, "acme", DocType{Name: "Note", Fields: []DocField{{Fieldname: "body", Fieldtype: FieldText}}})
-	doc, err := e.CreateDocument(ctx, c, "Note", map[string]any{"body": "hi"})
+	seed(t, e, "acme", DocType{Name: "Note", Module: "erp", Fields: []DocField{{Fieldname: "body", Fieldtype: FieldText}}})
+	doc, err := e.CreateDocument(ctx, c, at("erp", "Note"), map[string]any{"body": "hi"})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	_, err = e.Submit(ctx, c, "Note", doc.Name)
+	_, err = e.Submit(ctx, c, at("erp", "Note"), doc.Name)
 	if Classify(err) != CodeInvalid {
 		t.Fatalf("submit on a non-submittable doctype = %v (code %v), want CodeInvalid", err, Classify(err))
 	}
@@ -271,7 +275,7 @@ func TestOps_ValidationRefused(t *testing.T) {
 	e := testEngine(t)
 	ctx := context.Background()
 	seed(t, e, "acme", invoiceDT())
-	_, err := e.CreateDocument(ctx, owner("acme"), "Sales Invoice", map[string]any{"total": 1})
+	_, err := e.CreateDocument(ctx, owner("acme"), at("erp", "Sales Invoice"), map[string]any{"total": 1})
 	if Classify(err) != CodeInvalid {
 		t.Fatalf("missing required field = %v (code %v), want CodeInvalid", err, Classify(err))
 	}
@@ -288,7 +292,7 @@ func TestOps_PasswordNeverLeaves(t *testing.T) {
 	c := owner("acme")
 	seed(t, e, "acme", invoiceDT())
 
-	doc, err := e.CreateDocument(ctx, c, "Sales Invoice",
+	doc, err := e.CreateDocument(ctx, c, at("erp", "Sales Invoice"),
 		map[string]any{"customer": "X", "secret": "hunter2"})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -310,7 +314,7 @@ func TestOps_PasswordNeverLeaves(t *testing.T) {
 
 	// An update that echoes the marker back preserves the hash rather than
 	// storing the marker as a new password.
-	upd, err := e.UpdateDocument(ctx, c, "Sales Invoice", doc.Name,
+	upd, err := e.UpdateDocument(ctx, c, at("erp", "Sales Invoice"), doc.Name,
 		map[string]any{"customer": "X", "secret": doctype.RedactedMarker})
 	if err != nil {
 		t.Fatalf("update: %v", err)
@@ -329,7 +333,7 @@ func TestOps_WireProjection(t *testing.T) {
 	ctx := context.Background()
 	c := owner("acme")
 	seed(t, e, "acme", invoiceDT())
-	doc, err := e.CreateDocument(ctx, c, "Sales Invoice", map[string]any{"customer": "X", "total": 3.0})
+	doc, err := e.CreateDocument(ctx, c, at("erp", "Sales Invoice"), map[string]any{"customer": "X", "total": 3.0})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -357,11 +361,11 @@ func TestOps_Single(t *testing.T) {
 	ctx := context.Background()
 	c := owner("acme")
 	seed(t, e, "acme", DocType{
-		Name: "Settings", IsSingle: true,
+		Name: "Settings", Module: "erp", IsSingle: true,
 		Fields: []DocField{{Fieldname: "theme", Fieldtype: FieldData}},
 	})
 
-	got, err := e.GetDocument(ctx, c, "Settings", "Settings")
+	got, err := e.GetDocument(ctx, c, at("erp", "Settings"), "Settings")
 	if err != nil {
 		t.Fatalf("unwritten Single must read as an empty draft: %v", err)
 	}
@@ -369,13 +373,13 @@ func TestOps_Single(t *testing.T) {
 		t.Fatalf("unwritten Single has data: %v", got.Data)
 	}
 
-	if _, err := e.CreateDocument(ctx, c, "Settings", map[string]any{"theme": "dark"}); err != nil {
+	if _, err := e.CreateDocument(ctx, c, at("erp", "Settings"), map[string]any{"theme": "dark"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := e.UpdateDocument(ctx, c, "Settings", "Settings", map[string]any{"theme": "light"}); err != nil {
+	if _, err := e.UpdateDocument(ctx, c, at("erp", "Settings"), "Settings", map[string]any{"theme": "light"}); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	docs, err := e.ListDocuments(ctx, c, "Settings", ListOpts{})
+	docs, err := e.ListDocuments(ctx, c, at("erp", "Settings"), ListOpts{})
 	if err != nil || len(docs) != 1 {
 		t.Fatalf("Single lists %d documents, want 1 (%v)", len(docs), err)
 	}
@@ -395,37 +399,69 @@ func TestOps_DocTypeRegistry(t *testing.T) {
 	if _, err := e.DefineDocType(ctx, c, invoiceDT()); !errors.Is(err, ErrConflict) {
 		t.Fatalf("duplicate define = %v, want ErrConflict", err)
 	}
-	if _, err := e.DocTypeOf(ctx, c, "Nope"); !errors.Is(err, ErrNotFound) {
+	if _, err := e.DocTypeOf(ctx, c, at("erp", "Nope")); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown doctype = %v, want ErrNotFound", err)
 	}
 
-	// The name in the operation wins over the body — a host's URL is authoritative.
-	replaced, err := e.ReplaceDocType(ctx, c, "Sales Invoice", DocType{
-		Name: "Ignored", TitleField: "customer",
+	// The address in the operation wins over the body — a host's URL is
+	// authoritative, on BOTH halves of the pair.
+	replaced, err := e.ReplaceDocType(ctx, c, at("erp", "Sales Invoice"), DocType{
+		Name: "Ignored", Module: "ignored", TitleField: "customer",
 		Fields: []DocField{{Fieldname: "customer", Fieldtype: FieldData, Reqd: true}},
 	})
 	if err != nil {
 		t.Fatalf("replace: %v", err)
 	}
-	if replaced.Name != "Sales Invoice" {
-		t.Fatalf("replace honoured the body name: %q", replaced.Name)
+	if replaced.ID() != at("erp", "Sales Invoice") {
+		t.Fatalf("replace honoured the body address: %s", replaced.ID())
 	}
 
-	if err := e.DeleteDocType(ctx, c, "Sales Invoice"); err != nil {
+	if err := e.DeleteDocType(ctx, c, at("erp", "Sales Invoice")); err != nil {
 		t.Fatalf("delete doctype: %v", err)
 	}
-	if err := e.DeleteDocType(ctx, c, "Sales Invoice"); !errors.Is(err, ErrNotFound) {
+	if err := e.DeleteDocType(ctx, c, at("erp", "Sales Invoice")); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second delete = %v, want ErrNotFound", err)
 	}
 }
 
 // TestOps_InvalidSchemaRefused: a malformed DocType is refused at define time.
+//
+// The reserved-name list is gone. It existed because a bare name shared a
+// namespace with the static route segments, so "doctypes" could be read as
+// either; an address carries a dot and no segment does, and the two can no
+// longer meet. What the dot buys it also costs: a name carrying one would make
+// module.name ambiguous, so THAT is what define refuses now — along with a
+// module-less DocType, which has no address at all.
 func TestOps_InvalidSchemaRefused(t *testing.T) {
 	e := testEngine(t)
-	_, err := e.DefineDocType(context.Background(), owner("acme"), DocType{Name: "doctypes",
-		Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}})
-	if Classify(err) != CodeInvalid {
-		t.Fatalf("reserved name = %v (code %v), want CodeInvalid", err, Classify(err))
+	ctx := context.Background()
+	c := owner("acme")
+
+	for _, name := range []string{"doctypes", "modules", "summary", "roles", "health"} {
+		dt, err := e.DefineDocType(ctx, c, DocType{Name: name, Module: "erp",
+			Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}})
+		if err != nil {
+			t.Fatalf("DefineDocType(%q) = %v, want accepted — no name is reserved", name, err)
+		}
+		if got := dt.ID().String(); got != "erp."+name {
+			t.Fatalf("address = %q, want %q", got, "erp."+name)
+		}
+	}
+
+	for _, bad := range []struct {
+		why string
+		dt  DocType
+	}{
+		{"a dot in the name", DocType{Name: "erp.Item", Module: "erp",
+			Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}}},
+		{"no module", DocType{Name: "Orphan",
+			Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}}},
+		{"a Link target that is a bare name", DocType{Name: "Order", Module: "erp",
+			Fields: []DocField{{Fieldname: "item", Fieldtype: FieldLink, Options: "Item"}}}},
+	} {
+		if _, err := e.DefineDocType(ctx, c, bad.dt); Classify(err) != CodeInvalid {
+			t.Errorf("%s = %v (code %v), want CodeInvalid", bad.why, err, Classify(err))
+		}
 	}
 }
 
@@ -476,7 +512,7 @@ func TestOps_Modules(t *testing.T) {
 		t.Fatalf("non-manager installed a module: %v", err)
 	}
 	// And installing in orgA never touches orgB.
-	if _, err := e.DocTypeOf(ctx, owner("orgB"), "Widget"); !errors.Is(err, ErrNotFound) {
+	if _, err := e.DocTypeOf(ctx, owner("orgB"), at("shop", "Widget")); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("module install leaked across tenants: %v", err)
 	}
 }
@@ -489,7 +525,7 @@ func TestOps_Summary(t *testing.T) {
 	c := owner("acme")
 	seed(t, e, "acme", invoiceDT())
 	for i := 0; i < 3; i++ {
-		if _, err := e.CreateDocument(ctx, c, "Sales Invoice", map[string]any{"customer": "X"}); err != nil {
+		if _, err := e.CreateDocument(ctx, c, at("erp", "Sales Invoice"), map[string]any{"customer": "X"}); err != nil {
 			t.Fatalf("create: %v", err)
 		}
 	}
@@ -515,11 +551,11 @@ func TestOps_GateHookAborts(t *testing.T) {
 
 	resetHooks()
 	t.Cleanup(resetHooks)
-	RegisterHook("Sales Invoice", ActionBeforeInsert, func(_ context.Context, _ *Event) error {
+	RegisterHook(at("erp", "Sales Invoice"), ActionBeforeInsert, func(_ context.Context, _ *Event) error {
 		return errors.New("nope")
 	})
 
-	_, err := e.CreateDocument(ctx, c, "Sales Invoice", map[string]any{"customer": "X"})
+	_, err := e.CreateDocument(ctx, c, at("erp", "Sales Invoice"), map[string]any{"customer": "X"})
 	if err == nil {
 		t.Fatal("gate hook did not abort the create")
 	}
@@ -530,7 +566,7 @@ func TestOps_GateHookAborts(t *testing.T) {
 	if !errors.As(err, &abort) {
 		t.Fatalf("hook abort is not a *HookAbort: %T", err)
 	}
-	docs, err := e.ListDocuments(ctx, c, "Sales Invoice", ListOpts{})
+	docs, err := e.ListDocuments(ctx, c, at("erp", "Sales Invoice"), ListOpts{})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -548,11 +584,11 @@ func TestOps_BeforeSaveMutates(t *testing.T) {
 
 	resetHooks()
 	t.Cleanup(resetHooks)
-	RegisterHook("Sales Invoice", ActionBeforeSave, func(_ context.Context, ev *Event) error {
+	RegisterHook(at("erp", "Sales Invoice"), ActionBeforeSave, func(_ context.Context, ev *Event) error {
 		ev.Doc.Data["total"] = 99.0
 		return nil
 	})
-	doc, err := e.CreateDocument(ctx, c, "Sales Invoice", map[string]any{"customer": "X", "total": 1.0})
+	doc, err := e.CreateDocument(ctx, c, at("erp", "Sales Invoice"), map[string]any{"customer": "X", "total": 1.0})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -649,10 +685,10 @@ func TestEngine_ClosedIsHonest(t *testing.T) {
 	if _, err := e.ListDocTypes(ctx, owner("acme")); err == nil {
 		t.Error("closed engine served a read")
 	}
-	if _, err := e.Ingest(ctx, "acme", "x", nil, ""); err == nil {
+	if _, err := e.Ingest(ctx, "acme", at("erp", "x"), nil, ""); err == nil {
 		t.Error("closed engine served an ingest")
 	}
-	if e.Installed(ctx, "acme", "x") {
+	if e.Installed(ctx, "acme", at("erp", "x")) {
 		t.Error("closed engine reported a doctype installed")
 	}
 	if _, _, err := e.AcquireLease(ctx, "acme", "k", 0, 0); err == nil {

@@ -18,11 +18,11 @@ func TestAlwaysOn_RecordsStayOrgIsolated(t *testing.T) {
 	ctx := context.Background()
 
 	// The DocType DEFINITION resolves for BOTH orgs (schema is default-on for everyone).
-	dtA, err := s.GetDocType(ctx, "orga", "Flyer")
+	dtA, err := s.GetDocType(ctx, "orga", at("promo", "Flyer"))
 	if err != nil {
 		t.Fatalf("orga must resolve the always-on DocType: %v", err)
 	}
-	if _, err := s.GetDocType(ctx, "orgb", "Flyer"); err != nil {
+	if _, err := s.GetDocType(ctx, "orgb", at("promo", "Flyer")); err != nil {
 		t.Fatalf("orgb must resolve the same always-on DocType: %v", err)
 	}
 
@@ -37,11 +37,11 @@ func TestAlwaysOn_RecordsStayOrgIsolated(t *testing.T) {
 	}
 
 	// org B cannot GET org A's record by name, even though the DocType resolves for B.
-	if _, err := s.GetDocument(ctx, "orgb", "Flyer", saved.Name); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetDocument(ctx, "orgb", at("promo", "Flyer"), saved.Name); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-tenant read of org A's record must 404 for org B, got %v", err)
 	}
 	// org B's listing of the always-on DocType is empty — A's record never appears.
-	docsB, err := s.ListDocuments(ctx, "orgb", "Flyer", ListOpts{Limit: 100})
+	docsB, err := s.ListDocuments(ctx, "orgb", at("promo", "Flyer"), ListOpts{Limit: 100})
 	if err != nil {
 		t.Fatalf("orgb ListDocuments: %v", err)
 	}
@@ -49,12 +49,12 @@ func TestAlwaysOn_RecordsStayOrgIsolated(t *testing.T) {
 		t.Fatalf("org B must see ZERO of org A's always-on records, got %d", len(docsB))
 	}
 	// A per-org count confirms the physical scoping regardless of the listing path.
-	if n, err := s.CountDocuments(ctx, "orgb", "Flyer"); err != nil || n != 0 {
+	if n, err := s.CountDocuments(ctx, "orgb", at("promo", "Flyer")); err != nil || n != 0 {
 		t.Fatalf("org B record count must be 0, got %d (err %v)", n, err)
 	}
 
 	// Isolation is not over-blocking: org A still sees exactly its own record.
-	docsA, err := s.ListDocuments(ctx, "orga", "Flyer", ListOpts{Limit: 100})
+	docsA, err := s.ListDocuments(ctx, "orga", at("promo", "Flyer"), ListOpts{Limit: 100})
 	if err != nil {
 		t.Fatalf("orga ListDocuments: %v", err)
 	}

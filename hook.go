@@ -2,6 +2,7 @@ package framework
 
 import (
 	"context"
+	"github.com/hanzoai/doctype"
 	"sync"
 
 	luxlog "github.com/luxfi/log"
@@ -61,8 +62,8 @@ type Event struct {
 	// Org is the VALIDATED tenant (clients/principal.Org). A hook that touches
 	// sibling data MUST scope every query by it.
 	Org string
-	// DocType is the document's DocType name.
-	DocType string
+	// DocType is the document's DocType, by address.
+	DocType doctype.ID
 	// Doc is the document being acted on. In BeforeInsert/BeforeSave a hook may
 	// mutate Doc.Data and the mutation is persisted; elsewhere treat it as read.
 	Doc *Document
@@ -80,27 +81,34 @@ type Event struct {
 // phase aborts the operation (HTTP 422) before any state change.
 type Hook func(ctx context.Context, ev *Event) error
 
-// hookRegistry maps "doctype\x00action" → ordered hooks. It is populated at
+// hookRegistry maps (address, action) → ordered hooks. It is populated at
 // process init (RegisterHook) and read-only during serving, guarded by a mutex so
 // a late init() registration is still safe.
+//
+// The key carries the MODULE, so two lanes may each attach behaviour to their own
+// "page". Keyed by name alone, whichever registered first also answered for the
+// other.
+type hookKey struct {
+	id     doctype.ID
+	action string
+}
+
 var (
 	hookMu       sync.RWMutex
-	hookRegistry = map[string][]Hook{}
+	hookRegistry = map[hookKey][]Hook{}
 )
-
-func hookKey(doctype, action string) string { return doctype + "\x00" + action }
 
 // RegisterHook attaches fn to (doctype, action). Multiple hooks for the same key
 // run in registration order; the first error aborts the operation. Register from
 // a package init() so the wiring is declared once at build time. This is the ONE
 // way a DocType gains server-side behavior.
-func RegisterHook(doctype, action string, fn Hook) {
-	if fn == nil || doctype == "" || action == "" {
+func RegisterHook(id doctype.ID, action string, fn Hook) {
+	if fn == nil || id.Zero() || action == "" {
 		return
 	}
 	hookMu.Lock()
 	defer hookMu.Unlock()
-	k := hookKey(doctype, action)
+	k := hookKey{id: id, action: action}
 	hookRegistry[k] = append(hookRegistry[k], fn)
 }
 
@@ -108,7 +116,7 @@ func RegisterHook(doctype, action string, fn Hook) {
 // stopping at the first error. No registered hooks is a no-op.
 func runHooks(ctx context.Context, action string, ev *Event) error {
 	hookMu.RLock()
-	hooks := hookRegistry[hookKey(ev.DocType, action)]
+	hooks := hookRegistry[hookKey{id: ev.DocType, action: action}]
 	hookMu.RUnlock()
 	if len(hooks) == 0 {
 		return nil
@@ -139,5 +147,5 @@ func RegisteredHookCount() int {
 func resetHooks() {
 	hookMu.Lock()
 	defer hookMu.Unlock()
-	hookRegistry = map[string][]Hook{}
+	hookRegistry = map[hookKey][]Hook{}
 }

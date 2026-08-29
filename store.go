@@ -58,15 +58,34 @@ func openStore(path string, open OpenDBFunc) (*Store, error) {
 	return s, nil
 }
 
-// migrate creates the five framework tables. Idempotent (IF NOT EXISTS). Every
-// table leads its primary key with `org` so tenant isolation is a physical
-// property of the schema, not merely a WHERE clause.
+// migrate brings the database to the current schema: first the upgrade from the
+// previous one, then the tables themselves. Idempotent (IF NOT EXISTS), and the
+// upgrade is a no-op on a database that never held the old shape.
+//
+// Every table leads its primary key with `org` so tenant isolation is a physical
+// property of the schema, not merely a WHERE clause. A DocType is then keyed by
+// (module, name) and a document by (module, doctype, name): the module is half of
+// the key, not a column beside it, which is what makes two lanes' "page" two rows
+// instead of a collision.
 func (s *Store) migrate() error {
-	const ddl = `
-CREATE TABLE IF NOT EXISTS fw_doctypes (
+	if err := s.upgrade(); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(fmt.Sprintf(doctypesDDL, "fw_doctypes") + fmt.Sprintf(documentsDDL, "fw_documents") + indexDDL); err != nil {
+		return fmt.Errorf("framework migrate: %w", err)
+	}
+	return nil
+}
+
+// The schema, one template per table so the upgrade (upgrade.go) stages the
+// SAME definition under a temporary name — a second copy of these columns is
+// how a rebuilt table comes to differ from a freshly created one.
+const (
+	doctypesDDL = `
+CREATE TABLE IF NOT EXISTS %s (
   org            TEXT NOT NULL,
   name           TEXT NOT NULL,
-  module         TEXT NOT NULL DEFAULT '',
+  module         TEXT NOT NULL,
   is_single      INTEGER NOT NULL DEFAULT 0,
   is_submittable INTEGER NOT NULL DEFAULT 0,
   autoname       TEXT NOT NULL DEFAULT '',
@@ -75,21 +94,26 @@ CREATE TABLE IF NOT EXISTS fw_doctypes (
   permissions    TEXT NOT NULL DEFAULT '[]',
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL,
-  PRIMARY KEY (org, name)
+  PRIMARY KEY (org, module, name)
 );
-CREATE INDEX IF NOT EXISTS ix_fw_doctypes_org_module ON fw_doctypes(org, module);
-
-CREATE TABLE IF NOT EXISTS fw_documents (
+`
+	documentsDDL = `
+CREATE TABLE IF NOT EXISTS %s (
   org        TEXT NOT NULL,
+  module     TEXT NOT NULL,
   doctype    TEXT NOT NULL,
   name       TEXT NOT NULL,
   docstatus  INTEGER NOT NULL DEFAULT 0,
   data       TEXT NOT NULL DEFAULT '{}',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  PRIMARY KEY (org, doctype, name)
+  PRIMARY KEY (org, module, doctype, name)
 );
-CREATE INDEX IF NOT EXISTS ix_fw_documents_org_dt_updated ON fw_documents(org, doctype, updated_at);
+`
+	// The tables nothing re-keyed, plus the one index the address key does not
+	// already provide as a prefix of itself.
+	indexDDL = `
+CREATE INDEX IF NOT EXISTS ix_fw_documents_updated ON fw_documents(org, module, doctype, updated_at);
 
 CREATE TABLE IF NOT EXISTS fw_series (
   org     TEXT NOT NULL,
@@ -106,11 +130,7 @@ CREATE TABLE IF NOT EXISTS fw_locks (
   PRIMARY KEY (org, lockkey)
 );
 `
-	if _, err := s.db.Exec(ddl); err != nil {
-		return fmt.Errorf("framework migrate: %w", err)
-	}
-	return nil
-}
+)
 
 // Close closes the underlying database. Idempotent-safe via sql.DB.
 func (s *Store) Close() error { return s.db.Close() }
@@ -137,10 +157,10 @@ func (s *Store) CreateDocType(ctx context.Context, org string, dt DocType) (DocT
 	return dt, nil
 }
 
-func (s *Store) GetDocType(ctx context.Context, org, name string) (DocType, error) {
+func (s *Store) GetDocType(ctx context.Context, org string, id doctype.ID) (DocType, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT name,module,is_single,is_submittable,autoname,title_field,fields,permissions,created_at,updated_at
-		 FROM fw_doctypes WHERE org=? AND name=?`, org, name)
+		 FROM fw_doctypes WHERE org=? AND module=? AND name=?`, org, id.Module, id.Name)
 	dt, err := scanDocType(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		// No stored (per-org) definition. An always-on module's fixture resolves
@@ -148,7 +168,7 @@ func (s *Store) GetDocType(ctx context.Context, org, name string) (DocType, erro
 		// DocType DEFINITION resolves this way — every document row stays physically
 		// org-scoped (see always_on_isolation_test.go), so this exposes schema, never
 		// another org's data.
-		if fx, ok := doctype.AlwaysOn(name); ok {
+		if fx, ok := doctype.AlwaysOn(id); ok {
 			return fx, nil
 		}
 		return DocType{}, ErrNotFound
@@ -168,14 +188,14 @@ func (s *Store) ListDocTypes(ctx context.Context, org string) ([]DocType, error)
 	}
 	defer func() { _ = rows.Close() }()
 	out := make([]DocType, 0, 16)
-	seen := make(map[string]bool, 16)
+	seen := make(map[doctype.ID]bool, 16)
 	for rows.Next() {
 		dt, err := scanDocType(rows)
 		if err != nil {
 			return nil, fmt.Errorf("scan doctype: %w", err)
 		}
 		out = append(out, dt)
-		seen[dt.Name] = true
+		seen[dt.ID()] = true
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -184,9 +204,9 @@ func (s *Store) ListDocTypes(ctx context.Context, org string) ([]DocType, error)
 	// the listing matches GetDocType. Then re-sort by name to preserve the ORDER BY
 	// name ASC contract across the union.
 	for _, fx := range doctype.AlwaysOnAll() {
-		if !seen[fx.Name] {
+		if !seen[fx.ID()] {
 			out = append(out, fx)
-			seen[fx.Name] = true
+			seen[fx.ID()] = true
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -203,31 +223,31 @@ func (s *Store) ReplaceDocType(ctx context.Context, org string, dt DocType) (Doc
 	now := time.Now().Unix()
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE fw_doctypes SET module=?,is_single=?,is_submittable=?,autoname=?,title_field=?,fields=?,permissions=?,updated_at=?
-		 WHERE org=? AND name=?`,
+		 WHERE org=? AND module=? AND name=?`,
 		dt.Module, b2i(dt.IsSingle), b2i(dt.IsSubmittable), dt.Autoname, dt.TitleField,
-		string(fieldsJSON), string(permsJSON), now, org, dt.Name)
+		string(fieldsJSON), string(permsJSON), now, org, dt.Module, dt.Name)
 	if err != nil {
 		return DocType{}, fmt.Errorf("update doctype: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return DocType{}, ErrNotFound
 	}
-	return s.GetDocType(ctx, org, dt.Name)
+	return s.GetDocType(ctx, org, dt.ID())
 }
 
 // DeleteDocType removes a DocType and ALL of its documents in one transaction —
 // there are no orphaned documents without a schema. Returns false if absent.
-func (s *Store) DeleteDocType(ctx context.Context, org, name string) (bool, error) {
+func (s *Store) DeleteDocType(ctx context.Context, org string, id doctype.ID) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	res, err := tx.ExecContext(ctx, `DELETE FROM fw_doctypes WHERE org=? AND name=?`, org, name)
+	res, err := tx.ExecContext(ctx, `DELETE FROM fw_doctypes WHERE org=? AND module=? AND name=?`, org, id.Module, id.Name)
 	if err != nil {
 		return false, fmt.Errorf("delete doctype: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM fw_documents WHERE org=? AND doctype=?`, org, name); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM fw_documents WHERE org=? AND module=? AND doctype=?`, org, id.Module, id.Name); err != nil {
 		return false, fmt.Errorf("delete documents: %w", err)
 	}
 	n, _ := res.RowsAffected()
@@ -267,7 +287,7 @@ func scanDocType(sc interface{ Scan(...any) error }) (DocType, error) {
 // so this internal shape is the ONE representation the store works with.
 type Document struct {
 	Name      string
-	DocType   string
+	DocType   doctype.ID
 	DocStatus int
 	Data      map[string]any
 	CreatedAt int64
@@ -287,8 +307,8 @@ func (s *Store) CreateDocument(ctx context.Context, org string, dt *DocType, dat
 
 	insert := func(ctx context.Context, x execer, name string) error {
 		_, err := x.ExecContext(ctx,
-			`INSERT INTO fw_documents (org,doctype,name,docstatus,data,created_at,updated_at) VALUES (?,?,?,0,?,?,?)`,
-			org, dt.Name, name, string(blob), now, now)
+			`INSERT INTO fw_documents (org,module,doctype,name,docstatus,data,created_at,updated_at) VALUES (?,?,?,?,0,?,?,?)`,
+			org, dt.Module, dt.Name, name, string(blob), now, now)
 		return err
 	}
 
@@ -314,7 +334,7 @@ func (s *Store) CreateDocument(ctx context.Context, org string, dt *DocType, dat
 		if err := tx.Commit(); err != nil {
 			return Document{}, fmt.Errorf("commit: %w", err)
 		}
-		return Document{Name: name, DocType: dt.Name, Data: data, CreatedAt: now, UpdatedAt: now}, nil
+		return Document{Name: name, DocType: dt.ID(), Data: data, CreatedAt: now, UpdatedAt: now}, nil
 
 	default:
 		name, err := doctype.ResolveName(dt, data, requestedName)
@@ -327,7 +347,7 @@ func (s *Store) CreateDocument(ctx context.Context, org string, dt *DocType, dat
 			}
 			return Document{}, fmt.Errorf("insert document: %w", err)
 		}
-		return Document{Name: name, DocType: dt.Name, Data: data, CreatedAt: now, UpdatedAt: now}, nil
+		return Document{Name: name, DocType: dt.ID(), Data: data, CreatedAt: now, UpdatedAt: now}, nil
 	}
 }
 
@@ -340,20 +360,20 @@ func (s *Store) UpsertSingle(ctx context.Context, org string, dt *DocType, data 
 		return Document{}, fmt.Errorf("marshal data: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO fw_documents (org,doctype,name,docstatus,data,created_at,updated_at) VALUES (?,?,?,0,?,?,?)
-		 ON CONFLICT(org,doctype,name) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at`,
-		org, dt.Name, dt.Name, string(blob), now, now)
+		`INSERT INTO fw_documents (org,module,doctype,name,docstatus,data,created_at,updated_at) VALUES (?,?,?,?,0,?,?,?)
+		 ON CONFLICT(org,module,doctype,name) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at`,
+		org, dt.Module, dt.Name, dt.Name, string(blob), now, now)
 	if err != nil {
 		return Document{}, fmt.Errorf("upsert single: %w", err)
 	}
-	return s.GetDocument(ctx, org, dt.Name, dt.Name)
+	return s.GetDocument(ctx, org, dt.ID(), dt.Name)
 }
 
-func (s *Store) GetDocument(ctx context.Context, org, dtName, name string) (Document, error) {
+func (s *Store) GetDocument(ctx context.Context, org string, id doctype.ID, name string) (Document, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT name,docstatus,data,created_at,updated_at FROM fw_documents WHERE org=? AND doctype=? AND name=?`,
-		org, dtName, name)
-	d, err := scanDocument(row, dtName)
+		`SELECT name,docstatus,data,created_at,updated_at FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`,
+		org, id.Module, id.Name, name)
+	d, err := scanDocument(row, id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Document{}, ErrNotFound
 	}
@@ -376,10 +396,10 @@ type ListOpts struct {
 // filters (via json_extract, all values BOUND), an order key, and a bounded
 // limit. Every value is a bound parameter and every field name is validated
 // against the doctype's schema before it reaches a json path.
-func (s *Store) ListDocuments(ctx context.Context, org, dtName string, opts ListOpts) ([]Document, error) {
+func (s *Store) ListDocuments(ctx context.Context, org string, id doctype.ID, opts ListOpts) ([]Document, error) {
 	var (
-		where = []string{"org=?", "doctype=?"}
-		args  = []any{org, dtName}
+		where = []string{"org=?", "module=?", "doctype=?"}
+		args  = []any{org, id.Module, id.Name}
 	)
 	for field, val := range opts.Filters {
 		switch field {
@@ -432,7 +452,7 @@ func (s *Store) ListDocuments(ctx context.Context, org, dtName string, opts List
 	defer func() { _ = rows.Close() }()
 	out := make([]Document, 0, 16)
 	for rows.Next() {
-		d, err := scanDocument(rows, dtName)
+		d, err := scanDocument(rows, id)
 		if err != nil {
 			return nil, fmt.Errorf("scan document: %w", err)
 		}
@@ -455,8 +475,8 @@ func (s *Store) UpdateDocument(ctx context.Context, org string, dt *DocType, nam
 	}
 	defer func() { _ = tx.Rollback() }()
 	var status int
-	err = tx.QueryRowContext(ctx, `SELECT docstatus FROM fw_documents WHERE org=? AND doctype=? AND name=?`,
-		org, dt.Name, name).Scan(&status)
+	err = tx.QueryRowContext(ctx, `SELECT docstatus FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`,
+		org, dt.Module, dt.Name, name).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Document{}, ErrNotFound
 	}
@@ -467,29 +487,29 @@ func (s *Store) UpdateDocument(ctx context.Context, org string, dt *DocType, nam
 		return Document{}, ErrBadState
 	}
 	now := time.Now().Unix()
-	if _, err := tx.ExecContext(ctx, `UPDATE fw_documents SET data=?, updated_at=? WHERE org=? AND doctype=? AND name=?`,
-		string(blob), now, org, dt.Name, name); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE fw_documents SET data=?, updated_at=? WHERE org=? AND module=? AND doctype=? AND name=?`,
+		string(blob), now, org, dt.Module, dt.Name, name); err != nil {
 		return Document{}, fmt.Errorf("update document: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return Document{}, fmt.Errorf("commit: %w", err)
 	}
-	return s.GetDocument(ctx, org, dt.Name, name)
+	return s.GetDocument(ctx, org, dt.ID(), name)
 }
 
 // SetDocStatus transitions a document from `from` to `to` atomically, verifying
 // the current status equals `from` (else ErrBadState). This is the ONE path for
 // submit (0→1) and cancel (1→2); the check-and-set is inside a transaction so two
 // concurrent submits can't both win.
-func (s *Store) SetDocStatus(ctx context.Context, org, dtName, name string, from, to int) (Document, error) {
+func (s *Store) SetDocStatus(ctx context.Context, org string, id doctype.ID, name string, from, to int) (Document, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Document{}, fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	var status int
-	err = tx.QueryRowContext(ctx, `SELECT docstatus FROM fw_documents WHERE org=? AND doctype=? AND name=?`,
-		org, dtName, name).Scan(&status)
+	err = tx.QueryRowContext(ctx, `SELECT docstatus FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`,
+		org, id.Module, id.Name, name).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Document{}, ErrNotFound
 	}
@@ -500,20 +520,20 @@ func (s *Store) SetDocStatus(ctx context.Context, org, dtName, name string, from
 		return Document{}, ErrBadState
 	}
 	now := time.Now().Unix()
-	if _, err := tx.ExecContext(ctx, `UPDATE fw_documents SET docstatus=?, updated_at=? WHERE org=? AND doctype=? AND name=?`,
-		to, now, org, dtName, name); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE fw_documents SET docstatus=?, updated_at=? WHERE org=? AND module=? AND doctype=? AND name=?`,
+		to, now, org, id.Module, id.Name, name); err != nil {
 		return Document{}, fmt.Errorf("set docstatus: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return Document{}, fmt.Errorf("commit: %w", err)
 	}
-	return s.GetDocument(ctx, org, dtName, name)
+	return s.GetDocument(ctx, org, id, name)
 }
 
 // DeleteDocument removes a document by key. Returns false if absent. The service
 // enforces the lifecycle guard (a submitted doc must be cancelled first).
-func (s *Store) DeleteDocument(ctx context.Context, org, dtName, name string) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM fw_documents WHERE org=? AND doctype=? AND name=?`, org, dtName, name)
+func (s *Store) DeleteDocument(ctx context.Context, org string, id doctype.ID, name string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`, org, id.Module, id.Name, name)
 	if err != nil {
 		return false, fmt.Errorf("delete document: %w", err)
 	}
@@ -522,13 +542,13 @@ func (s *Store) DeleteDocument(ctx context.Context, org, dtName, name string) (b
 }
 
 // CountDocuments returns the org's document count for a doctype (real, per-org).
-func (s *Store) CountDocuments(ctx context.Context, org, dtName string) (int, error) {
+func (s *Store) CountDocuments(ctx context.Context, org string, id doctype.ID) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM fw_documents WHERE org=? AND doctype=?`, org, dtName).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM fw_documents WHERE org=? AND module=? AND doctype=?`, org, id.Module, id.Name).Scan(&n)
 	return n, err
 }
 
-func scanDocument(sc interface{ Scan(...any) error }, dtName string) (Document, error) {
+func scanDocument(sc interface{ Scan(...any) error }, id doctype.ID) (Document, error) {
 	var (
 		d    Document
 		blob string
@@ -536,7 +556,7 @@ func scanDocument(sc interface{ Scan(...any) error }, dtName string) (Document, 
 	if err := sc.Scan(&d.Name, &d.DocStatus, &blob, &d.CreatedAt, &d.UpdatedAt); err != nil {
 		return Document{}, err
 	}
-	d.DocType = dtName
+	d.DocType = id
 	if err := json.Unmarshal([]byte(blob), &d.Data); err != nil {
 		return Document{}, fmt.Errorf("unmarshal data: %w", err)
 	}
@@ -548,13 +568,13 @@ func scanDocument(sc interface{ Scan(...any) error }, dtName string) (Document, 
 
 // documentExists reports whether (org, doctype, name) exists — the in-org Link
 // reference check. table/column are constants; name is a bound parameter.
-func (s *Store) documentExists(ctx context.Context, org, dtName, name string) (bool, error) {
+func (s *Store) documentExists(ctx context.Context, org string, id doctype.ID, name string) (bool, error) {
 	if name == "" {
 		return false, nil
 	}
 	var one int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT 1 FROM fw_documents WHERE org=? AND doctype=? AND name=?`, org, dtName, name).Scan(&one)
+		`SELECT 1 FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`, org, id.Module, id.Name, name).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -568,11 +588,11 @@ func (s *Store) documentExists(ctx context.Context, org, dtName, name string) (b
 // carries `value` for `field` — the Unique-field check. `field` is validated
 // against the schema before this call and BOUND into the json path; excludeName
 // lets an update skip the row being updated.
-func (s *Store) fieldValueTaken(ctx context.Context, org, dtName, field, value, excludeName string) (bool, error) {
+func (s *Store) fieldValueTaken(ctx context.Context, org string, id doctype.ID, field, value, excludeName string) (bool, error) {
 	var one int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT 1 FROM fw_documents WHERE org=? AND doctype=? AND name<>? AND CAST(json_extract(data,'$.'||?) AS TEXT)=? LIMIT 1`,
-		org, dtName, excludeName, field, value).Scan(&one)
+		`SELECT 1 FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name<>? AND CAST(json_extract(data,'$.'||?) AS TEXT)=? LIMIT 1`,
+		org, id.Module, id.Name, excludeName, field, value).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}

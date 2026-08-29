@@ -27,7 +27,7 @@ import (
 // re-syncs).
 type Ingested struct {
 	Org     string
-	DocType string
+	DocType doctype.ID
 	Name    string
 }
 
@@ -40,7 +40,7 @@ type Ingested struct {
 // It errors if the engine is not open,
 // and surfaces validation/lifecycle/store errors verbatim so a connector can record
 // them on its connection status.
-func (e *Engine) Ingest(ctx context.Context, org, dtName string, data map[string]any, requestedName string) (Ingested, error) {
+func (e *Engine) Ingest(ctx context.Context, org string, id doctype.ID, data map[string]any, requestedName string) (Ingested, error) {
 	if err := e.ready(); err != nil {
 		return Ingested{}, err
 	}
@@ -48,23 +48,23 @@ func (e *Engine) Ingest(ctx context.Context, org, dtName string, data map[string
 		return Ingested{}, fmt.Errorf("framework.Ingest: empty org")
 	}
 
-	dt, err := e.store.GetDocType(ctx, org, dtName)
+	dt, err := e.store.GetDocType(ctx, org, id)
 	if err != nil {
-		return Ingested{}, fmt.Errorf("framework.Ingest: doctype %q: %w", dtName, err)
+		return Ingested{}, fmt.Errorf("framework.Ingest: doctype %s: %w", id, err)
 	}
 
 	// Single doctypes are upserts, not appends; a connector ingests many documents
 	// into a normal (non-single) doctype (kb-source), so reject Single here rather
 	// than silently overwriting the one row.
 	if dt.IsSingle {
-		return Ingested{}, fmt.Errorf("framework.Ingest: %q is a Single doctype", dtName)
+		return Ingested{}, fmt.Errorf("framework.Ingest: %s is a Single doctype", id)
 	}
 
 	validated, err := e.store.validateDoc(ctx, org, &dt, data, nil, "", false)
 	if err != nil {
 		return Ingested{}, err
 	}
-	doc := Document{DocType: dt.Name, Data: validated}
+	doc := Document{DocType: dt.ID(), Data: validated}
 	ev := e.event(org, &dt, &doc, nil)
 	if err := e.gate(ctx, ActionBeforeInsert, ev); err != nil {
 		return Ingested{}, err
@@ -78,17 +78,17 @@ func (e *Engine) Ingest(ctx context.Context, org, dtName string, data map[string
 	}
 	// after_save runs the indexing hook (non-fatal, logged) exactly as on the HTTP path.
 	e.after(ctx, org, &dt, &saved, nil)
-	return Ingested{Org: org, DocType: dt.Name, Name: saved.Name}, nil
+	return Ingested{Org: org, DocType: dt.ID(), Name: saved.Name}, nil
 }
 
 // Installed reports whether `doctype` exists in `org` (i.e. the module was
 // installed). A connector checks this before a sync so it can return an honest
 // "install the kb module first" rather than a doctype-not-found error mid-sync.
-func (e *Engine) Installed(ctx context.Context, org, dtName string) bool {
+func (e *Engine) Installed(ctx context.Context, org string, id doctype.ID) bool {
 	if e.ready() != nil {
 		return false
 	}
-	_, err := e.store.GetDocType(ctx, org, dtName)
+	_, err := e.store.GetDocType(ctx, org, id)
 	return err == nil
 }
 
@@ -106,7 +106,7 @@ func (e *Engine) ModuleInstalled(ctx context.Context, org, module string) bool {
 		return false
 	}
 	for _, dt := range doctype.Fixtures(module) {
-		if _, err := e.store.GetDocType(ctx, org, dt.Name); err == nil {
+		if _, err := e.store.GetDocType(ctx, org, doctype.ID{Module: module, Name: dt.Name}); err == nil {
 			return true
 		}
 	}
@@ -118,15 +118,15 @@ func (e *Engine) ModuleInstalled(ctx context.Context, org, module string) bool {
 // uses it to refresh an already-ingested kb-source (same external_id) on re-sync so
 // the vector point is updated in place rather than duplicated. `name` is the
 // engine-assigned document name from a prior Ingest.
-func (e *Engine) UpdateData(ctx context.Context, org, dtName, name string, data map[string]any) error {
+func (e *Engine) UpdateData(ctx context.Context, org string, id doctype.ID, name string, data map[string]any) error {
 	if err := e.ready(); err != nil {
 		return err
 	}
-	dt, err := e.store.GetDocType(ctx, org, dtName)
+	dt, err := e.store.GetDocType(ctx, org, id)
 	if err != nil {
-		return fmt.Errorf("framework.UpdateData: doctype %q: %w", dtName, err)
+		return fmt.Errorf("framework.UpdateData: doctype %s: %w", id, err)
 	}
-	prev, err := e.store.GetDocument(ctx, org, dtName, name)
+	prev, err := e.store.GetDocument(ctx, org, id, name)
 	if err != nil {
 		return err
 	}
@@ -134,7 +134,7 @@ func (e *Engine) UpdateData(ctx context.Context, org, dtName, name string, data 
 	if err != nil {
 		return err
 	}
-	doc := Document{Name: name, DocType: dt.Name, Data: validated}
+	doc := Document{Name: name, DocType: dt.ID(), Data: validated}
 	ev := e.event(org, &dt, &doc, &prev)
 	if err := e.gate(ctx, ActionBeforeSave, ev); err != nil {
 		return err
@@ -151,11 +151,11 @@ func (e *Engine) UpdateData(ctx context.Context, org, dtName, name string, data 
 // `field` equals `value`, or "" if none. A connector uses it to find an existing
 // kb-source by external_id (idempotent re-sync: update in place vs. create new).
 // `field` is validated against the doctype schema by ListDocuments' bound json path.
-func (e *Engine) FindByField(ctx context.Context, org, dtName, field, value string) (string, error) {
+func (e *Engine) FindByField(ctx context.Context, org string, id doctype.ID, field, value string) (string, error) {
 	if err := e.ready(); err != nil {
 		return "", err
 	}
-	docs, err := e.store.ListDocuments(ctx, org, dtName, ListOpts{
+	docs, err := e.store.ListDocuments(ctx, org, id, ListOpts{
 		Filters: map[string]string{field: value},
 		Limit:   1,
 	})
@@ -176,18 +176,18 @@ func (e *Engine) FindByField(ctx context.Context, org, dtName, field, value stri
 // other delete — never a forked write path. It returns ErrNotFound when the
 // document does not exist (idempotent from the caller's view: a missing edge is a
 // no-op).
-func (e *Engine) Delete(ctx context.Context, org, dtName, name string) error {
+func (e *Engine) Delete(ctx context.Context, org string, id doctype.ID, name string) error {
 	if err := e.ready(); err != nil {
 		return err
 	}
 	if org == "" {
 		return fmt.Errorf("framework.Delete: empty org")
 	}
-	dt, err := e.store.GetDocType(ctx, org, dtName)
+	dt, err := e.store.GetDocType(ctx, org, id)
 	if err != nil {
-		return fmt.Errorf("framework.Delete: doctype %q: %w", dtName, err)
+		return fmt.Errorf("framework.Delete: doctype %s: %w", id, err)
 	}
-	prev, err := e.store.GetDocument(ctx, org, dtName, name)
+	prev, err := e.store.GetDocument(ctx, org, id, name)
 	if err != nil {
 		return err
 	}
@@ -195,7 +195,7 @@ func (e *Engine) Delete(ctx context.Context, org, dtName, name string) error {
 	if err := e.gate(ctx, ActionOnTrash, ev); err != nil {
 		return err
 	}
-	deleted, err := e.store.DeleteDocument(ctx, org, dtName, name)
+	deleted, err := e.store.DeleteDocument(ctx, org, id, name)
 	if err != nil {
 		return err
 	}
@@ -209,11 +209,11 @@ func (e *Engine) Delete(ctx context.Context, org, dtName, name string) error {
 // KB retrieval surface) uses to hydrate search hits or count ingested docs without
 // re-implementing the store query. It is a thin, validated pass-through to
 // ListDocuments — every result is physically scoped to `org`.
-func (e *Engine) Search(ctx context.Context, org, dtName string, filters map[string]string, limit int) ([]Document, error) {
+func (e *Engine) Search(ctx context.Context, org string, id doctype.ID, filters map[string]string, limit int) ([]Document, error) {
 	if err := e.ready(); err != nil {
 		return nil, err
 	}
-	return e.store.ListDocuments(ctx, org, dtName, ListOpts{Filters: filters, Limit: limit})
+	return e.store.ListDocuments(ctx, org, id, ListOpts{Filters: filters, Limit: limit})
 }
 
 // Get returns a single document by name in (org, doctype) — the read-one twin of
@@ -221,9 +221,9 @@ func (e *Engine) Search(ctx context.Context, org, dtName string, filters map[str
 // document to compute a lifecycle transition). `org` MUST be a validated tenant the
 // caller already resolved. It returns ErrNotFound when the document does not exist, so
 // the caller can answer 404 rather than 500.
-func (e *Engine) Get(ctx context.Context, org, dtName, name string) (Document, error) {
+func (e *Engine) Get(ctx context.Context, org string, id doctype.ID, name string) (Document, error) {
 	if err := e.ready(); err != nil {
 		return Document{}, err
 	}
-	return e.store.GetDocument(ctx, org, dtName, name)
+	return e.store.GetDocument(ctx, org, id, name)
 }

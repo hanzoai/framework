@@ -93,7 +93,7 @@ func (e *Engine) ListDocTypes(ctx context.Context, c Caller) ([]DocType, error) 
 }
 
 // DocTypeOf returns one DocType definition from the caller's org.
-func (e *Engine) DocTypeOf(ctx context.Context, c Caller, name string) (DocType, error) {
+func (e *Engine) DocTypeOf(ctx context.Context, c Caller, id doctype.ID) (DocType, error) {
 	if err := e.ready(); err != nil {
 		return DocType{}, err
 	}
@@ -101,13 +101,13 @@ func (e *Engine) DocTypeOf(ctx context.Context, c Caller, name string) (DocType,
 	if err != nil {
 		return DocType{}, err
 	}
-	return e.store.GetDocType(ctx, acc.Org, name)
+	return e.store.GetDocType(ctx, acc.Org, id)
 }
 
-// ReplaceDocType replaces a DocType definition (PUT semantics). `name` is
-// authoritative over dt.Name, so a host's URL always wins over its body.
+// ReplaceDocType replaces a DocType definition (PUT semantics). `id` is
+// authoritative over the body's own module and name, so a host's URL always wins.
 // Documents already stored under it are left intact. Manager-only.
-func (e *Engine) ReplaceDocType(ctx context.Context, c Caller, name string, dt DocType) (DocType, error) {
+func (e *Engine) ReplaceDocType(ctx context.Context, c Caller, id doctype.ID, dt DocType) (DocType, error) {
 	if err := e.ready(); err != nil {
 		return DocType{}, err
 	}
@@ -115,7 +115,7 @@ func (e *Engine) ReplaceDocType(ctx context.Context, c Caller, name string, dt D
 	if err != nil {
 		return DocType{}, err
 	}
-	dt.Name = name
+	dt.Module, dt.Name = id.Module, id.Name
 	if err := dt.Validate(); err != nil {
 		return DocType{}, doctype.Errorf("%s", err.Error())
 	}
@@ -123,7 +123,7 @@ func (e *Engine) ReplaceDocType(ctx context.Context, c Caller, name string, dt D
 }
 
 // DeleteDocType removes a DocType and all of its documents. Manager-only.
-func (e *Engine) DeleteDocType(ctx context.Context, c Caller, name string) error {
+func (e *Engine) DeleteDocType(ctx context.Context, c Caller, id doctype.ID) error {
 	if err := e.ready(); err != nil {
 		return err
 	}
@@ -131,7 +131,7 @@ func (e *Engine) DeleteDocType(ctx context.Context, c Caller, name string) error
 	if err != nil {
 		return err
 	}
-	deleted, err := e.store.DeleteDocType(ctx, acc.Org, name)
+	deleted, err := e.store.DeleteDocType(ctx, acc.Org, id)
 	if err != nil {
 		return err
 	}
@@ -177,7 +177,7 @@ func (e *Engine) ModuleOf(ctx context.Context, c Caller, module string) (ModuleS
 	}
 	installed := make([]string, 0, len(fx))
 	for _, dt := range fx {
-		if _, err := e.store.GetDocType(ctx, acc.Org, dt.Name); err == nil {
+		if _, err := e.store.GetDocType(ctx, acc.Org, doctype.ID{Module: module, Name: dt.Name}); err == nil {
 			installed = append(installed, dt.Name)
 		} else if !errors.Is(err, ErrNotFound) {
 			return ModuleState{}, err
@@ -205,13 +205,13 @@ func (e *Engine) InstallModule(ctx context.Context, c Caller, module string) (In
 	}
 	res := Install{Module: module, Created: []string{}, Existing: []string{}}
 	for _, dt := range fx {
-		if _, err := e.store.GetDocType(ctx, acc.Org, dt.Name); err == nil {
+		dt.Module = module // the lane owns the module tag, and it is half the key
+		if _, err := e.store.GetDocType(ctx, acc.Org, dt.ID()); err == nil {
 			res.Existing = append(res.Existing, dt.Name)
 			continue
 		} else if !errors.Is(err, ErrNotFound) {
 			return Install{}, err
 		}
-		dt.Module = module // the lane owns the module tag
 		if err := dt.Validate(); err != nil {
 			return Install{}, fmt.Errorf("fixture %q invalid: %w", dt.Name, err)
 		}
@@ -240,11 +240,11 @@ func fixtureNames(fx []DocType) []string {
 // CreateDocument validates and inserts a document, running the create hook
 // pipeline: validate → before_insert → before_save → INSERT → after_save.
 // A Single DocType is upserted instead (create and update are the same write).
-func (e *Engine) CreateDocument(ctx context.Context, c Caller, dtName string, in map[string]any) (Doc, error) {
+func (e *Engine) CreateDocument(ctx context.Context, c Caller, id doctype.ID, in map[string]any) (Doc, error) {
 	if err := e.ready(); err != nil {
 		return Doc{}, err
 	}
-	acc, dt, err := e.accessDoc(ctx, c, dtName, doctype.RightCreate)
+	acc, dt, err := e.accessDoc(ctx, c, id, doctype.RightCreate)
 	if err != nil {
 		return Doc{}, err
 	}
@@ -255,7 +255,7 @@ func (e *Engine) CreateDocument(ctx context.Context, c Caller, dtName string, in
 	if err != nil {
 		return Doc{}, err
 	}
-	doc := Document{DocType: dt.Name, Data: validated}
+	doc := Document{DocType: dt.ID(), Data: validated}
 	ev := e.event(acc.Org, &dt, &doc, nil)
 	if err := e.gate(ctx, ActionBeforeInsert, ev); err != nil {
 		return Doc{}, err
@@ -273,11 +273,11 @@ func (e *Engine) CreateDocument(ctx context.Context, c Caller, dtName string, in
 
 // ListDocuments returns the org's documents of a DocType. A Single lists as its
 // one document (a virtual empty draft when never written).
-func (e *Engine) ListDocuments(ctx context.Context, c Caller, dtName string, opts ListOpts) ([]Doc, error) {
+func (e *Engine) ListDocuments(ctx context.Context, c Caller, id doctype.ID, opts ListOpts) ([]Doc, error) {
 	if err := e.ready(); err != nil {
 		return nil, err
 	}
-	acc, dt, err := e.accessDoc(ctx, c, dtName, doctype.RightRead)
+	acc, dt, err := e.accessDoc(ctx, c, id, doctype.RightRead)
 	if err != nil {
 		return nil, err
 	}
@@ -288,7 +288,7 @@ func (e *Engine) ListDocuments(ctx context.Context, c Caller, dtName string, opt
 		}
 		return []Doc{{Document: doc, Meta: &dt}}, nil
 	}
-	rows, err := e.store.ListDocuments(ctx, acc.Org, dt.Name, opts)
+	rows, err := e.store.ListDocuments(ctx, acc.Org, dt.ID(), opts)
 	if err != nil {
 		return nil, err
 	}
@@ -300,11 +300,11 @@ func (e *Engine) ListDocuments(ctx context.Context, c Caller, dtName string, opt
 }
 
 // GetDocument returns one document by name.
-func (e *Engine) GetDocument(ctx context.Context, c Caller, dtName, name string) (Doc, error) {
+func (e *Engine) GetDocument(ctx context.Context, c Caller, id doctype.ID, name string) (Doc, error) {
 	if err := e.ready(); err != nil {
 		return Doc{}, err
 	}
-	acc, dt, err := e.accessDoc(ctx, c, dtName, doctype.RightRead)
+	acc, dt, err := e.accessDoc(ctx, c, id, doctype.RightRead)
 	if err != nil {
 		return Doc{}, err
 	}
@@ -315,7 +315,7 @@ func (e *Engine) GetDocument(ctx context.Context, c Caller, dtName, name string)
 		}
 		return Doc{Document: doc, Meta: &dt}, nil
 	}
-	doc, err := e.store.GetDocument(ctx, acc.Org, dt.Name, name)
+	doc, err := e.store.GetDocument(ctx, acc.Org, dt.ID(), name)
 	if err != nil {
 		return Doc{}, err
 	}
@@ -325,18 +325,18 @@ func (e *Engine) GetDocument(ctx context.Context, c Caller, dtName, name string)
 // UpdateDocument replaces a DRAFT document's data, running validate →
 // before_save → UPDATE → after_save. A submitted or cancelled document is
 // immutable, so the submit lifecycle cannot be bypassed by a plain update.
-func (e *Engine) UpdateDocument(ctx context.Context, c Caller, dtName, name string, in map[string]any) (Doc, error) {
+func (e *Engine) UpdateDocument(ctx context.Context, c Caller, id doctype.ID, name string, in map[string]any) (Doc, error) {
 	if err := e.ready(); err != nil {
 		return Doc{}, err
 	}
-	acc, dt, err := e.accessDoc(ctx, c, dtName, doctype.RightWrite)
+	acc, dt, err := e.accessDoc(ctx, c, id, doctype.RightWrite)
 	if err != nil {
 		return Doc{}, err
 	}
 	if dt.IsSingle {
 		return e.writeSingle(ctx, acc, &dt, in)
 	}
-	prev, err := e.store.GetDocument(ctx, acc.Org, dt.Name, name)
+	prev, err := e.store.GetDocument(ctx, acc.Org, dt.ID(), name)
 	if err != nil {
 		return Doc{}, err
 	}
@@ -347,7 +347,7 @@ func (e *Engine) UpdateDocument(ctx context.Context, c Caller, dtName, name stri
 	if err != nil {
 		return Doc{}, err
 	}
-	doc := Document{DocType: dt.Name, Name: name, Data: validated, DocStatus: prev.DocStatus}
+	doc := Document{DocType: dt.ID(), Name: name, Data: validated, DocStatus: prev.DocStatus}
 	ev := e.event(acc.Org, &dt, &doc, &prev)
 	if err := e.gate(ctx, ActionBeforeSave, ev); err != nil {
 		return Doc{}, err
@@ -362,18 +362,18 @@ func (e *Engine) UpdateDocument(ctx context.Context, c Caller, dtName, name stri
 
 // DeleteDocument removes a document after the on_trash gate. A submitted
 // document must be cancelled first.
-func (e *Engine) DeleteDocument(ctx context.Context, c Caller, dtName, name string) error {
+func (e *Engine) DeleteDocument(ctx context.Context, c Caller, id doctype.ID, name string) error {
 	if err := e.ready(); err != nil {
 		return err
 	}
-	acc, dt, err := e.accessDoc(ctx, c, dtName, doctype.RightDelete)
+	acc, dt, err := e.accessDoc(ctx, c, id, doctype.RightDelete)
 	if err != nil {
 		return err
 	}
 	if dt.IsSingle {
 		name = dt.Name
 	}
-	prev, err := e.store.GetDocument(ctx, acc.Org, dt.Name, name)
+	prev, err := e.store.GetDocument(ctx, acc.Org, dt.ID(), name)
 	if err != nil {
 		return err
 	}
@@ -384,7 +384,7 @@ func (e *Engine) DeleteDocument(ctx context.Context, c Caller, dtName, name stri
 	if err := e.gate(ctx, ActionOnTrash, ev); err != nil {
 		return err
 	}
-	deleted, err := e.store.DeleteDocument(ctx, acc.Org, dt.Name, name)
+	deleted, err := e.store.DeleteDocument(ctx, acc.Org, dt.ID(), name)
 	if err != nil {
 		return err
 	}
@@ -395,22 +395,22 @@ func (e *Engine) DeleteDocument(ctx context.Context, c Caller, dtName, name stri
 }
 
 // Submit transitions a submittable document 0→1 after the on_submit gate.
-func (e *Engine) Submit(ctx context.Context, c Caller, dtName, name string) (Doc, error) {
-	return e.transition(ctx, c, dtName, name, doctype.RightSubmit, 0, 1, ActionOnSubmit)
+func (e *Engine) Submit(ctx context.Context, c Caller, id doctype.ID, name string) (Doc, error) {
+	return e.transition(ctx, c, id, name, doctype.RightSubmit, 0, 1, ActionOnSubmit)
 }
 
 // Cancel transitions a submittable document 1→2 after the on_cancel gate.
-func (e *Engine) Cancel(ctx context.Context, c Caller, dtName, name string) (Doc, error) {
-	return e.transition(ctx, c, dtName, name, doctype.RightCancel, 1, 2, ActionOnCancel)
+func (e *Engine) Cancel(ctx context.Context, c Caller, id doctype.ID, name string) (Doc, error) {
+	return e.transition(ctx, c, id, name, doctype.RightCancel, 1, 2, ActionOnCancel)
 }
 
 // transition is the shared submit/cancel path: gate on the right, require the
 // DocType be submittable, run the lifecycle gate hook, then flip docstatus.
-func (e *Engine) transition(ctx context.Context, c Caller, dtName, name, right string, from, to int, action string) (Doc, error) {
+func (e *Engine) transition(ctx context.Context, c Caller, id doctype.ID, name, right string, from, to int, action string) (Doc, error) {
 	if err := e.ready(); err != nil {
 		return Doc{}, err
 	}
-	acc, dt, err := e.accessDoc(ctx, c, dtName, right)
+	acc, dt, err := e.accessDoc(ctx, c, id, right)
 	if err != nil {
 		return Doc{}, err
 	}
@@ -420,7 +420,7 @@ func (e *Engine) transition(ctx context.Context, c Caller, dtName, name, right s
 	if dt.IsSingle {
 		name = dt.Name
 	}
-	doc, err := e.store.GetDocument(ctx, acc.Org, dt.Name, name)
+	doc, err := e.store.GetDocument(ctx, acc.Org, dt.ID(), name)
 	if err != nil {
 		return Doc{}, err
 	}
@@ -431,7 +431,7 @@ func (e *Engine) transition(ctx context.Context, c Caller, dtName, name, right s
 	if err := e.gate(ctx, action, ev); err != nil {
 		return Doc{}, err
 	}
-	saved, err := e.store.SetDocStatus(ctx, acc.Org, dt.Name, name, from, to)
+	saved, err := e.store.SetDocStatus(ctx, acc.Org, dt.ID(), name, from, to)
 	if err != nil {
 		return Doc{}, err
 	}
@@ -453,7 +453,7 @@ func (e *Engine) Summary(ctx context.Context, c Caller) (Summary, error) {
 	}
 	var docs int
 	for _, dt := range dts {
-		n, err := e.store.CountDocuments(ctx, acc.Org, dt.Name)
+		n, err := e.store.CountDocuments(ctx, acc.Org, dt.ID())
 		if err != nil {
 			return Summary{}, err
 		}
@@ -467,9 +467,9 @@ func (e *Engine) Summary(ctx context.Context, c Caller) (Summary, error) {
 // single returns the Single's document, or a virtual empty draft when it has
 // not been written yet (a Single always "exists").
 func (e *Engine) single(ctx context.Context, org string, dt *DocType) (Document, error) {
-	doc, err := e.store.GetDocument(ctx, org, dt.Name, dt.Name)
+	doc, err := e.store.GetDocument(ctx, org, dt.ID(), dt.Name)
 	if errors.Is(err, ErrNotFound) {
-		return Document{Name: dt.Name, DocType: dt.Name, Data: map[string]any{}}, nil
+		return Document{Name: dt.Name, DocType: dt.ID(), Data: map[string]any{}}, nil
 	}
 	return doc, err
 }
@@ -480,7 +480,7 @@ func (e *Engine) single(ctx context.Context, org string, dt *DocType) (Document,
 // preserves a redacted Password across an unchanged update by passing the
 // current data as `prev` to the validator.
 func (e *Engine) writeSingle(ctx context.Context, acc Access, dt *DocType, in map[string]any) (Doc, error) {
-	cur, curErr := e.store.GetDocument(ctx, acc.Org, dt.Name, dt.Name)
+	cur, curErr := e.store.GetDocument(ctx, acc.Org, dt.ID(), dt.Name)
 	var prev map[string]any
 	if curErr == nil {
 		if cur.DocStatus != 0 {
@@ -494,7 +494,7 @@ func (e *Engine) writeSingle(ctx context.Context, acc Access, dt *DocType, in ma
 	if err != nil {
 		return Doc{}, err
 	}
-	doc := Document{DocType: dt.Name, Name: dt.Name, Data: validated}
+	doc := Document{DocType: dt.ID(), Name: dt.Name, Data: validated}
 	ev := e.event(acc.Org, dt, &doc, nil)
 	if err := e.gate(ctx, ActionBeforeSave, ev); err != nil {
 		return Doc{}, err
@@ -509,7 +509,7 @@ func (e *Engine) writeSingle(ctx context.Context, acc Access, dt *DocType, in ma
 
 // event builds the value a lifecycle hook receives.
 func (e *Engine) event(org string, dt *DocType, doc, prev *Document) *Event {
-	return &Event{Org: org, DocType: dt.Name, Doc: doc, Prev: prev, Meta: dt, Store: e.store, Logger: e.log}
+	return &Event{Org: org, DocType: dt.ID(), Doc: doc, Prev: prev, Meta: dt, Store: e.store, Logger: e.log}
 }
 
 // gate runs a GATE phase: a hook error aborts the operation before any state

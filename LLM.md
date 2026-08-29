@@ -66,6 +66,20 @@ type Caller struct {
 the tenant, not the ability to go looking for one. It cannot be handed a request
 to inspect, so there is exactly ONE way a tenant enters the engine.
 
+## Addressing a DocType
+
+A DocType is identified by the pair `(Module, Name)` — `doctype.ID` — because a
+name is unique only within its module. It renders as `module.name`, and that
+address is what a URL segment, a Link or Table target, and a stored document's
+doctype key all carry. `doctype.ParseID` reads one back; neither half may contain
+the dot, so the round trip is exact.
+
+```go
+id := doctype.ID{Module: "erp", Name: "Sales Invoice"}
+id.String()                       // "erp.Sales Invoice"
+doctype.ParseID("erp.Item")       // doctype.ID{Module: "erp", Name: "Item"}
+```
+
 ## Operations
 
 Every operation takes a `Caller` and **enforces permissions itself**, so
@@ -76,7 +90,8 @@ one. A host's job is: decode, resolve a Caller, call, render, map the Code.
 e, _ := framework.Open(framework.Config{Dir: dataDir})
 defer e.Close()
 
-doc, err := e.CreateDocument(ctx, caller, "Sales Invoice", map[string]any{
+invoice := doctype.ID{Module: "erp", Name: "Sales Invoice"}
+doc, err := e.CreateDocument(ctx, caller, invoice, map[string]any{
     "customer": "Widgets Ltd",
 })
 switch framework.Classify(err) {
@@ -120,7 +135,7 @@ document would let a host marshal it directly and leak the hash.
 Attach behaviour by registering a `Hook` from a package `init()`:
 
 ```go
-framework.RegisterHook("Sales Invoice", framework.ActionBeforeSave,
+framework.RegisterHook(invoice, framework.ActionBeforeSave,
     func(ctx context.Context, ev *framework.Event) error {
         ev.Doc.Data["total"] = computeTotal(ev.Doc.Data)  // mutation persists
         return nil

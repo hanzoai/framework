@@ -53,7 +53,7 @@ func (d Doc) Wire(fields []string) map[string]any {
 		}
 	}
 	m["name"] = d.Name
-	m["doctype"] = d.DocType
+	m["doctype"] = d.DocType.String()
 	m["docstatus"] = d.DocStatus
 	m["createdAt"] = d.CreatedAt
 	m["updatedAt"] = d.UpdatedAt

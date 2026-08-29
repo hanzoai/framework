@@ -40,7 +40,7 @@ func TestAlwaysOn_ResolvesFixtureForFreshOrg(t *testing.T) {
 	ctx := context.Background()
 
 	// The always-on fixture resolves for a fresh org, stamped with its module.
-	dt, err := s.GetDocType(ctx, "acme", "Flyer")
+	dt, err := s.GetDocType(ctx, "acme", at("promo", "Flyer"))
 	if err != nil {
 		t.Fatalf("always-on Flyer must resolve for a fresh org, got %v", err)
 	}
@@ -56,11 +56,11 @@ func TestAlwaysOn_ResolvesFixtureForFreshOrg(t *testing.T) {
 	}
 
 	// A NON-always-on module's DocType is NOT resolved — it still requires install.
-	if _, err := s.GetDocType(ctx, "acme", "Ledger"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetDocType(ctx, "acme", at("optin", "Ledger")); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("opt-in module's DocType must NOT resolve without install, got %v", err)
 	}
 	// An entirely unknown name is still 404.
-	if _, err := s.GetDocType(ctx, "acme", "Nope"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.GetDocType(ctx, "acme", at("promo", "Nope")); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown DocType want ErrNotFound, got %v", err)
 	}
 }
@@ -82,7 +82,7 @@ func TestAlwaysOn_StoredDefinitionWins(t *testing.T) {
 		t.Fatalf("CreateDocType (customize): %v", err)
 	}
 
-	got, err := s.GetDocType(ctx, "acme", "Flyer")
+	got, err := s.GetDocType(ctx, "acme", at("promo", "Flyer"))
 	if err != nil {
 		t.Fatalf("GetDocType after customize: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestAlwaysOn_StoredDefinitionWins(t *testing.T) {
 
 	// A DIFFERENT org still gets the fixture (isolation: one org's override never
 	// leaks into another).
-	other, err := s.GetDocType(ctx, "maxpower", "Flyer")
+	other, err := s.GetDocType(ctx, "maxpower", at("promo", "Flyer"))
 	if err != nil {
 		t.Fatalf("other org must still resolve the fixture, got %v", err)
 	}
@@ -115,18 +115,28 @@ func TestAlwaysOn_ListIncludesFixtures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListDocTypes: %v", err)
 	}
-	if !hasDocType(list, "Flyer") {
+	if !hasDocType(list, at("promo", "Flyer")) {
 		t.Fatalf("fresh-org listing must include the always-on fixture, got %v", names(list))
 	}
 
 	// After customizing, the listing has exactly ONE Flyer (the stored override,
 	// deduped against the fixture) — never a duplicate.
-	if _, err := s.CreateDocType(ctx, "acme", DocType{Name: "Flyer", Fields: []DocField{{Fieldname: "title", Fieldtype: FieldData}}}); err != nil {
+	if _, err := s.CreateDocType(ctx, "acme", DocType{Name: "Flyer", Module: "promo", Fields: []DocField{{Fieldname: "title", Fieldtype: FieldData}}}); err != nil {
 		t.Fatalf("customize: %v", err)
 	}
 	list, _ = s.ListDocTypes(ctx, "acme")
-	if n := count(list, "Flyer"); n != 1 {
+	if n := count(list, at("promo", "Flyer")); n != 1 {
 		t.Fatalf("customized listing must have exactly one Flyer (no fixture dupe), got %d", n)
+	}
+	// And the survivor is the org's STORED row, not the fixture: the override
+	// dropped `body`, so a Flyer still carrying it is the fixture winning.
+	for _, dt := range list {
+		if dt.ID() != at("promo", "Flyer") {
+			continue
+		}
+		if _, ok := dt.Field("body"); ok {
+			t.Fatalf("the fixture survived the dedupe, not the org's override: %v", names(list))
+		}
 	}
 }
 
@@ -139,7 +149,7 @@ func TestAlwaysOn_VirtualDocTypeBacksDocumentWrites(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
 
-	dt, err := s.GetDocType(ctx, "acme", "Flyer")
+	dt, err := s.GetDocType(ctx, "acme", at("promo", "Flyer"))
 	if err != nil {
 		t.Fatalf("resolve virtual DocType: %v", err)
 	}
@@ -151,7 +161,7 @@ func TestAlwaysOn_VirtualDocTypeBacksDocumentWrites(t *testing.T) {
 		t.Fatal("document must be named")
 	}
 	// It reads back under (org, doctype, name).
-	got, err := s.GetDocument(ctx, "acme", "Flyer", saved.Name)
+	got, err := s.GetDocument(ctx, "acme", at("promo", "Flyer"), saved.Name)
 	if err != nil {
 		t.Fatalf("GetDocument: %v", err)
 	}
@@ -170,11 +180,11 @@ func TestAlwaysOn_Registry(t *testing.T) {
 	}
 }
 
-func hasDocType(list []DocType, name string) bool { return count(list, name) > 0 }
-func count(list []DocType, name string) int {
+func hasDocType(list []DocType, id doctype.ID) bool { return count(list, id) > 0 }
+func count(list []DocType, id doctype.ID) int {
 	n := 0
 	for _, dt := range list {
-		if dt.Name == name {
+		if dt.ID() == id {
 			n++
 		}
 	}
@@ -183,7 +193,7 @@ func count(list []DocType, name string) int {
 func names(list []DocType) []string {
 	out := make([]string, len(list))
 	for i, dt := range list {
-		out[i] = dt.Name
+		out[i] = dt.ID().String()
 	}
 	return out
 }

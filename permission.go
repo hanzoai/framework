@@ -83,17 +83,17 @@ func (e *Engine) resolveManager(ctx context.Context, c Caller) (Access, error) {
 
 // accessDoc resolves the caller AND loads the target DocType, enforcing `right`
 // in one place. It is the ONE gate every document operation passes through.
-func (e *Engine) accessDoc(ctx context.Context, c Caller, name, right string) (Access, doctype.DocType, error) {
+func (e *Engine) accessDoc(ctx context.Context, c Caller, id doctype.ID, right string) (Access, doctype.DocType, error) {
 	acc, err := e.resolve(ctx, c)
 	if err != nil {
 		return Access{}, doctype.DocType{}, err
 	}
-	dt, err := e.store.GetDocType(ctx, acc.Org, name)
+	dt, err := e.store.GetDocType(ctx, acc.Org, id)
 	if err != nil {
 		return Access{}, doctype.DocType{}, err
 	}
 	if !acc.Can(&dt, right) {
-		return Access{}, doctype.DocType{}, fmt.Errorf("%w: permission denied: %s on %s", ErrForbidden, right, dt.Name)
+		return Access{}, doctype.DocType{}, fmt.Errorf("%w: permission denied: %s on %s", ErrForbidden, right, dt.ID())
 	}
 	return acc, dt, nil
 }

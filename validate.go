@@ -82,8 +82,12 @@ func (s *Store) validateDoc(ctx context.Context, org string, dt *DocType, in, pr
 
 		switch f.Fieldtype {
 		case FieldLink:
+			target, err := doctype.ParseID(f.Options)
+			if err != nil {
+				return nil, doctype.Errorf("field %q: %s", f.Fieldname, err)
+			}
 			name, _ := val.(string)
-			ok, err := s.documentExists(ctx, org, f.Options, name)
+			ok, err := s.documentExists(ctx, org, target, name)
 			if err != nil {
 				return nil, err
 			}
@@ -100,7 +104,7 @@ func (s *Store) validateDoc(ctx context.Context, org string, dt *DocType, in, pr
 
 		if f.Unique && !child {
 			if str := fmt.Sprint(val); str != "" {
-				taken, err := s.fieldValueTaken(ctx, org, dt.Name, f.Fieldname, str, excludeName)
+				taken, err := s.fieldValueTaken(ctx, org, dt.ID(), f.Fieldname, str, excludeName)
 				if err != nil {
 					return nil, err
 				}
@@ -133,7 +137,11 @@ func (s *Store) validateChildTable(ctx context.Context, org string, f DocField, 
 	if len(arr) > doctype.MaxChildRows {
 		return nil, doctype.Errorf("field %q has too many rows (max %d)", f.Fieldname, doctype.MaxChildRows)
 	}
-	childDT, err := s.GetDocType(ctx, org, f.Options)
+	target, err := doctype.ParseID(f.Options)
+	if err != nil {
+		return nil, doctype.Errorf("field %q: %s", f.Fieldname, err)
+	}
+	childDT, err := s.GetDocType(ctx, org, target)
 	if err == ErrNotFound {
 		return nil, doctype.Errorf("field %q references unknown child doctype %q", f.Fieldname, f.Options)
 	}
@@ -172,15 +180,19 @@ func (s *Store) applyFetchFrom(ctx context.Context, org string, dt *DocType, out
 		if !ok || lf.Fieldtype != FieldLink {
 			continue
 		}
+		id, err := doctype.ParseID(lf.Options)
+		if err != nil {
+			continue
+		}
 		// Never fetch a secret: if the source field is a Password in the target
 		// DocType, its stored value is an argon2 hash — copying it into this
 		// (non-Password) field would leak the hash past wireDoc's redaction.
-		if target, err := s.GetDocType(ctx, org, lf.Options); err == nil {
+		if target, err := s.GetDocType(ctx, org, id); err == nil {
 			if sf, ok := target.Field(src); ok && sf.Fieldtype == FieldPassword {
 				continue
 			}
 		}
-		doc, err := s.GetDocument(ctx, org, lf.Options, linkVal)
+		doc, err := s.GetDocument(ctx, org, id, linkVal)
 		if err == ErrNotFound {
 			continue
 		}

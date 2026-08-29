@@ -32,23 +32,35 @@ func mustDocType(t *testing.T, s *Store, org string, dt DocType) DocType {
 }
 
 // TestDocTypeValidate covers the schema well-formedness gate.
+//
+// A DocType is identified by the pair (module, name), rendered module.name, so
+// the module is required and neither half may carry the separator. The old
+// reserved-name list is gone with the ambiguity it guarded: a bare name shared a
+// namespace with the static route segments, an address does not, so "doctypes"
+// is an ordinary name and a DOTTED name is the malformed one.
 func TestDocTypeValidate(t *testing.T) {
 	cases := []struct {
 		name string
 		dt   DocType
 		ok   bool
 	}{
-		{"ok", DocType{Name: "Task", Fields: []DocField{{Fieldname: "subject", Fieldtype: FieldData}}}, true},
-		{"richtext ok", DocType{Name: "Post", Fields: []DocField{{Fieldname: "body", Fieldtype: FieldRichText}}}, true},
-		{"no name", DocType{Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}}, false},
-		{"reserved name", DocType{Name: "doctypes", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}}, false},
-		{"no fields", DocType{Name: "Empty"}, false},
-		{"bad fieldname", DocType{Name: "X", Fields: []DocField{{Fieldname: "Bad Name", Fieldtype: FieldData}}}, false},
-		{"unknown fieldtype", DocType{Name: "X", Fields: []DocField{{Fieldname: "a", Fieldtype: "Bogus"}}}, false},
-		{"select needs options", DocType{Name: "X", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldSelect}}}, false},
-		{"link needs options", DocType{Name: "X", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldLink}}}, false},
-		{"dup fieldname", DocType{Name: "X", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}, {Fieldname: "a", Fieldtype: FieldInt}}}, false},
-		{"autoname unknown field", DocType{Name: "X", Autoname: "field:missing", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}}, false},
+		{"ok", DocType{Name: "Task", Module: "erp", Fields: []DocField{{Fieldname: "subject", Fieldtype: FieldData}}}, true},
+		{"richtext ok", DocType{Name: "Post", Module: "cms", Fields: []DocField{{Fieldname: "body", Fieldtype: FieldRichText}}}, true},
+		{"formerly reserved name", DocType{Name: "doctypes", Module: "erp", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}}, true},
+		{"no name", DocType{Module: "erp", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}}, false},
+		{"no module", DocType{Name: "Task", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}}, false},
+		{"dotted name", DocType{Name: "erp.Item", Module: "erp", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}}, false},
+		{"dotted module", DocType{Name: "Item", Module: "erp.core", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}}, false},
+		{"no fields", DocType{Name: "Empty", Module: "erp"}, false},
+		{"bad fieldname", DocType{Name: "X", Module: "erp", Fields: []DocField{{Fieldname: "Bad Name", Fieldtype: FieldData}}}, false},
+		{"unknown fieldtype", DocType{Name: "X", Module: "erp", Fields: []DocField{{Fieldname: "a", Fieldtype: "Bogus"}}}, false},
+		{"select needs options", DocType{Name: "X", Module: "erp", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldSelect}}}, false},
+		{"link needs options", DocType{Name: "X", Module: "erp", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldLink}}}, false},
+		{"link target is an address", DocType{Name: "X", Module: "erp", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldLink, Options: "erp.Company"}}}, true},
+		{"link target is a bare name", DocType{Name: "X", Module: "erp", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldLink, Options: "Company"}}}, false},
+		{"table target is a bare name", DocType{Name: "X", Module: "erp", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldTable, Options: "Line Item"}}}, false},
+		{"dup fieldname", DocType{Name: "X", Module: "erp", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}, {Fieldname: "a", Fieldtype: FieldInt}}}, false},
+		{"autoname unknown field", DocType{Name: "X", Module: "erp", Autoname: "field:missing", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -71,20 +83,20 @@ func TestFieldTypeValidation(t *testing.T) {
 	const org = "acme"
 
 	// A Company to link to.
-	mustDocType(t, s, org, DocType{Name: "Company", Fields: []DocField{{Fieldname: "title", Fieldtype: FieldData}}})
-	comp, err := s.CreateDocument(ctx, org, ptr(DocType{Name: "Company", Fields: []DocField{{Fieldname: "title", Fieldtype: FieldData}}}), map[string]any{"title": "Acme"}, "")
+	company := mustDocType(t, s, org, DocType{Name: "Company", Module: "erp", Fields: []DocField{{Fieldname: "title", Fieldtype: FieldData}}})
+	comp, err := s.CreateDocument(ctx, org, &company, map[string]any{"title": "Acme"}, "")
 	if err != nil {
 		t.Fatalf("seed company: %v", err)
 	}
 
-	dt := mustDocType(t, s, org, DocType{Name: "Widget", Fields: []DocField{
+	dt := mustDocType(t, s, org, DocType{Name: "Widget", Module: "erp", Fields: []DocField{
 		{Fieldname: "code", Fieldtype: FieldData, Reqd: true},
 		{Fieldname: "qty", Fieldtype: FieldInt},
 		{Fieldname: "price", Fieldtype: FieldCurrency},
 		{Fieldname: "active", Fieldtype: FieldCheck},
 		{Fieldname: "due", Fieldtype: FieldDate},
 		{Fieldname: "status", Fieldtype: FieldSelect, Options: "Open\nClosed"},
-		{Fieldname: "company", Fieldtype: FieldLink, Options: "Company"},
+		{Fieldname: "company", Fieldtype: FieldLink, Options: "erp.Company"},
 		{Fieldname: "body", Fieldtype: FieldRichText},
 	}})
 
@@ -138,7 +150,7 @@ func TestPasswordHashedAndRedacted(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
 	const org = "acme"
-	dt := mustDocType(t, s, org, DocType{Name: "Cred", Autoname: "field:key", Fields: []DocField{
+	dt := mustDocType(t, s, org, DocType{Name: "Cred", Module: "erp", Autoname: "field:key", Fields: []DocField{
 		{Fieldname: "key", Fieldtype: FieldData, Reqd: true},
 		{Fieldname: "secret", Fieldtype: FieldPassword},
 	}})
@@ -181,13 +193,13 @@ func TestNaming(t *testing.T) {
 	ctx := context.Background()
 	const org = "acme"
 
-	hashDT := mustDocType(t, s, org, DocType{Name: "H", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}})
+	hashDT := mustDocType(t, s, org, DocType{Name: "H", Module: "erp", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}})
 	d1, _ := s.CreateDocument(ctx, org, &hashDT, map[string]any{"a": "x"}, "")
 	if len(d1.Name) != 32 {
 		t.Fatalf("hash name want 32 hex, got %q", d1.Name)
 	}
 
-	fieldDT := mustDocType(t, s, org, DocType{Name: "F", Autoname: "field:code", Fields: []DocField{{Fieldname: "code", Fieldtype: FieldData, Reqd: true}}})
+	fieldDT := mustDocType(t, s, org, DocType{Name: "F", Module: "erp", Autoname: "field:code", Fields: []DocField{{Fieldname: "code", Fieldtype: FieldData, Reqd: true}}})
 	out, _ := s.validateDoc(ctx, org, &fieldDT, map[string]any{"code": "ABC"}, nil, "", false)
 	df, _ := s.CreateDocument(ctx, org, &fieldDT, out, "")
 	if df.Name != "ABC" {
@@ -198,7 +210,7 @@ func TestNaming(t *testing.T) {
 		t.Fatalf("dup field name want ErrConflict, got %v", err)
 	}
 
-	promptDT := mustDocType(t, s, org, DocType{Name: "P", Autoname: "prompt", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}})
+	promptDT := mustDocType(t, s, org, DocType{Name: "P", Module: "erp", Autoname: "prompt", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}})
 	if _, err := s.CreateDocument(ctx, org, &promptDT, map[string]any{"a": "x"}, ""); err == nil {
 		t.Fatalf("prompt naming without name should fail")
 	}
@@ -207,7 +219,7 @@ func TestNaming(t *testing.T) {
 		t.Fatalf("prompt naming want MY-001, got %q (%v)", dp.Name, err)
 	}
 
-	serDT := mustDocType(t, s, org, DocType{Name: "Inv", Autoname: "INV-.YYYY.-.####", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}})
+	serDT := mustDocType(t, s, org, DocType{Name: "Inv", Module: "erp", Autoname: "INV-.YYYY.-.####", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}})
 	s1, _ := s.CreateDocument(ctx, org, &serDT, map[string]any{"a": "x"}, "")
 	s2, _ := s.CreateDocument(ctx, org, &serDT, map[string]any{"a": "y"}, "")
 	yr := time.Now().Year()
@@ -241,13 +253,13 @@ func TestChildTable(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
 	const org = "acme"
-	mustDocType(t, s, org, DocType{Name: "Line Item", Fields: []DocField{
+	mustDocType(t, s, org, DocType{Name: "Line Item", Module: "erp", Fields: []DocField{
 		{Fieldname: "item", Fieldtype: FieldData, Reqd: true},
 		{Fieldname: "qty", Fieldtype: FieldInt},
 	}})
-	order := mustDocType(t, s, org, DocType{Name: "Order", Fields: []DocField{
+	order := mustDocType(t, s, org, DocType{Name: "Order", Module: "erp", Fields: []DocField{
 		{Fieldname: "customer", Fieldtype: FieldData},
-		{Fieldname: "items", Fieldtype: FieldTable, Options: "Line Item"},
+		{Fieldname: "items", Fieldtype: FieldTable, Options: "erp.Line Item"},
 	}})
 
 	good := map[string]any{"customer": "Acme", "items": []any{
@@ -275,18 +287,18 @@ func TestDocStatusLifecycle(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
 	const org = "acme"
-	dt := mustDocType(t, s, org, DocType{Name: "JE", IsSubmittable: true, Fields: []DocField{{Fieldname: "memo", Fieldtype: FieldData}}})
+	dt := mustDocType(t, s, org, DocType{Name: "JE", Module: "erp", IsSubmittable: true, Fields: []DocField{{Fieldname: "memo", Fieldtype: FieldData}}})
 	d, _ := s.CreateDocument(ctx, org, &dt, map[string]any{"memo": "x"}, "")
 	if d.DocStatus != 0 {
 		t.Fatalf("new doc want docstatus 0, got %d", d.DocStatus)
 	}
 	// submit 0→1
-	sub, err := s.SetDocStatus(ctx, org, "JE", d.Name, 0, 1)
+	sub, err := s.SetDocStatus(ctx, org, at("erp", "JE"), d.Name, 0, 1)
 	if err != nil || sub.DocStatus != 1 {
 		t.Fatalf("submit want docstatus 1, got %d (%v)", sub.DocStatus, err)
 	}
 	// double submit → ErrBadState
-	if _, err := s.SetDocStatus(ctx, org, "JE", d.Name, 0, 1); err != ErrBadState {
+	if _, err := s.SetDocStatus(ctx, org, at("erp", "JE"), d.Name, 0, 1); err != ErrBadState {
 		t.Fatalf("double submit want ErrBadState, got %v", err)
 	}
 	// edit submitted → ErrBadState
@@ -294,7 +306,7 @@ func TestDocStatusLifecycle(t *testing.T) {
 		t.Fatalf("edit submitted want ErrBadState, got %v", err)
 	}
 	// cancel 1→2
-	can, err := s.SetDocStatus(ctx, org, "JE", d.Name, 1, 2)
+	can, err := s.SetDocStatus(ctx, org, at("erp", "JE"), d.Name, 1, 2)
 	if err != nil || can.DocStatus != 2 {
 		t.Fatalf("cancel want docstatus 2, got %d (%v)", can.DocStatus, err)
 	}
@@ -305,27 +317,27 @@ func TestDocStatusLifecycle(t *testing.T) {
 func TestPerOrgIsolation_Store(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
-	dtA := mustDocType(t, s, "orgA", DocType{Name: "Note", Fields: []DocField{{Fieldname: "body", Fieldtype: FieldData}}})
+	dtA := mustDocType(t, s, "orgA", DocType{Name: "Note", Module: "erp", Fields: []DocField{{Fieldname: "body", Fieldtype: FieldData}}})
 	docA, _ := s.CreateDocument(ctx, "orgA", &dtA, map[string]any{"body": "secret A"}, "")
 
 	// orgB has no such doctype.
-	if _, err := s.GetDocType(ctx, "orgB", "Note"); err != ErrNotFound {
+	if _, err := s.GetDocType(ctx, "orgB", at("erp", "Note")); err != ErrNotFound {
 		t.Fatalf("orgB must not see orgA doctype, got %v", err)
 	}
 	// orgB cannot read orgA's document even by exact name.
-	if _, err := s.GetDocument(ctx, "orgB", "Note", docA.Name); err != ErrNotFound {
+	if _, err := s.GetDocument(ctx, "orgB", at("erp", "Note"), docA.Name); err != ErrNotFound {
 		t.Fatalf("orgB must not read orgA doc, got %v", err)
 	}
 	// orgB's list of Note is empty.
-	rows, _ := s.ListDocuments(ctx, "orgB", "Note", ListOpts{})
+	rows, _ := s.ListDocuments(ctx, "orgB", at("erp", "Note"), ListOpts{})
 	if len(rows) != 0 {
 		t.Fatalf("orgB Note list want empty, got %d", len(rows))
 	}
 	// orgB delete of orgA's doc affects nothing.
-	if ok, _ := s.DeleteDocument(ctx, "orgB", "Note", docA.Name); ok {
+	if ok, _ := s.DeleteDocument(ctx, "orgB", at("erp", "Note"), docA.Name); ok {
 		t.Fatalf("orgB delete of orgA doc must be a no-op")
 	}
-	if _, err := s.GetDocument(ctx, "orgA", "Note", docA.Name); err != nil {
+	if _, err := s.GetDocument(ctx, "orgA", at("erp", "Note"), docA.Name); err != nil {
 		t.Fatalf("orgA doc must survive orgB delete attempt: %v", err)
 	}
 }
@@ -338,20 +350,20 @@ func TestHooks(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
 	const org = "acme"
-	dt := mustDocType(t, s, org, DocType{Name: "Hooked", IsSubmittable: true, Fields: []DocField{
+	dt := mustDocType(t, s, org, DocType{Name: "Hooked", Module: "erp", IsSubmittable: true, Fields: []DocField{
 		{Fieldname: "n", Fieldtype: FieldInt},
 		{Fieldname: "doubled", Fieldtype: FieldInt},
 	}})
 
 	// before_save computes doubled = n*2 (mutation persists).
-	RegisterHook("Hooked", ActionBeforeSave, func(_ context.Context, ev *Event) error {
+	RegisterHook(at("erp", "Hooked"), ActionBeforeSave, func(_ context.Context, ev *Event) error {
 		if n, ok := ev.Doc.Data["n"].(int64); ok {
 			ev.Doc.Data["doubled"] = n * 2
 		}
 		return nil
 	})
 	// on_submit gate: refuse to submit when n is negative.
-	RegisterHook("Hooked", ActionOnSubmit, func(_ context.Context, ev *Event) error {
+	RegisterHook(at("erp", "Hooked"), ActionOnSubmit, func(_ context.Context, ev *Event) error {
 		if n, _ := ev.Doc.Data["n"].(int64); n < 0 {
 			return doctype.Errorf("n must be non-negative to submit")
 		}
@@ -359,8 +371,8 @@ func TestHooks(t *testing.T) {
 	})
 
 	out, _ := s.validateDoc(ctx, org, &dt, map[string]any{"n": float64(21)}, nil, "", false)
-	doc := Document{DocType: dt.Name, Data: out}
-	ev := &Event{Org: org, DocType: dt.Name, Doc: &doc, Meta: &dt, Store: s}
+	doc := Document{DocType: dt.ID(), Data: out}
+	ev := &Event{Org: org, DocType: dt.ID(), Doc: &doc, Meta: &dt, Store: s}
 	if err := runHooks(ctx, ActionBeforeSave, ev); err != nil {
 		t.Fatalf("before_save: %v", err)
 	}
@@ -369,14 +381,13 @@ func TestHooks(t *testing.T) {
 	}
 
 	// on_submit gate rejects negative.
-	neg := Document{DocType: dt.Name, Data: map[string]any{"n": int64(-1)}}
-	evNeg := &Event{Org: org, DocType: dt.Name, Doc: &neg, Meta: &dt, Store: s}
+	neg := Document{DocType: dt.ID(), Data: map[string]any{"n": int64(-1)}}
+	evNeg := &Event{Org: org, DocType: dt.ID(), Doc: &neg, Meta: &dt, Store: s}
 	if err := runHooks(ctx, ActionOnSubmit, evNeg); err == nil {
 		t.Fatalf("on_submit gate should reject negative n")
 	}
 }
 
-func ptr(dt DocType) *DocType { return &dt }
 func itoa(n int) string {
 	if n == 0 {
 		return "0"
