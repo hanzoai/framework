@@ -1,6 +1,6 @@
 module github.com/hanzoai/framework
 
-go 1.26.5
+go 1.26.8
 
 require (
 	github.com/hanzoai/doctype v0.1.2
