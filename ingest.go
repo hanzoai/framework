@@ -235,6 +235,17 @@ func (e *Engine) Among(ctx context.Context, org string, id doctype.ID, among map
 	return e.store.ListDocuments(ctx, org, id, ListOpts{Among: among, Limit: limit, Desc: true})
 }
 
+// Names is the in-process, org-scoped list asked for identity alone: WHICH
+// documents match, by name, without their field data. A caller that needs the
+// SET a filter picks out — the sites under contract to one customer — pays the
+// JSON of every document to learn a name the row already carries.
+func (e *Engine) Names(ctx context.Context, org string, id doctype.ID, filters map[string]string, limit int) ([]string, error) {
+	if err := e.ready(); err != nil {
+		return nil, err
+	}
+	return e.store.ListNames(ctx, org, id, ListOpts{Filters: filters, Limit: limit, Desc: true})
+}
+
 // Get returns a single document by name in (org, doctype) — the read-one twin of
 // Search for a first-party in-process reader (the content lane reads the current
 // document to compute a lifecycle transition). `org` MUST be a validated tenant the

@@ -446,6 +446,54 @@ type ListOpts struct {
 // limit. Every value is a bound parameter and every field name is validated
 // against the doctype's schema before it reaches a json path.
 func (s *Store) ListDocuments(ctx context.Context, org string, id doctype.ID, opts ListOpts) ([]Document, error) {
+	q, args, any := listQuery(org, id, opts, "name,docstatus,data,created_at,updated_at")
+	if !any {
+		return []Document{}, nil
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list documents: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]Document, 0, 16)
+	for rows.Next() {
+		d, err := scanDocument(rows, id)
+		if err != nil {
+			return nil, fmt.Errorf("scan document: %w", err)
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// ListNames is the same question asked for identity alone: WHICH documents
+// match, without their field data. A caller that needs the set — the sites one
+// customer's estate is made of — otherwise pays the JSON of every document to
+// learn a name the row carries in a column of its own.
+func (s *Store) ListNames(ctx context.Context, org string, id doctype.ID, opts ListOpts) ([]string, error) {
+	q, args, any := listQuery(org, id, opts, "name")
+	if !any {
+		return []string{}, nil
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list names: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]string, 0, 16)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan name: %w", err)
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
+// listQuery builds one list read over `cols`. It answers false when the query
+// can match nothing, which is what a field named with an empty set means.
+func listQuery(org string, id doctype.ID, opts ListOpts, cols string) (string, []any, bool) {
 	var (
 		where = []string{"org=?", "module=?", "doctype=?"}
 		args  = []any{org, id.Module, id.Name}
@@ -475,7 +523,7 @@ func (s *Store) ListDocuments(ctx context.Context, org string, id doctype.ID, op
 	for _, field := range among {
 		vals := opts.Among[field]
 		if len(vals) == 0 {
-			return []Document{}, nil
+			return "", nil, false
 		}
 		marks := strings.TrimSuffix(strings.Repeat("?,", len(vals)), ",")
 		switch field {
@@ -514,27 +562,12 @@ func (s *Store) ListDocuments(ctx context.Context, org string, id doctype.ID, op
 		limit = doctype.DefaultLimit
 	}
 
-	q := `SELECT name,docstatus,data,created_at,updated_at FROM fw_documents WHERE ` +
+	q := `SELECT ` + cols + ` FROM fw_documents WHERE ` +
 		strings.Join(where, " AND ") + ` ORDER BY ` + order + ` ` + dir + ` LIMIT ?`
 	if strings.Contains(order, "json_extract") {
 		args = append(args, opts.OrderField)
 	}
-	args = append(args, limit)
-
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, fmt.Errorf("list documents: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-	out := make([]Document, 0, 16)
-	for rows.Next() {
-		d, err := scanDocument(rows, id)
-		if err != nil {
-			return nil, fmt.Errorf("scan document: %w", err)
-		}
-		out = append(out, d)
-	}
-	return out, rows.Err()
+	return q, append(args, limit), true
 }
 
 // UpdateDocument replaces a document's data. Only a DRAFT (docstatus 0) is
