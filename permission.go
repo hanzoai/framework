@@ -28,15 +28,20 @@ type Access struct {
 	Manager bool
 }
 
-// Can reports whether the caller may perform `right` on a document of dt.
-// A manager may do anything; otherwise the permission calculus decides.
+// Can reports whether the caller may perform `right` on a document of dt. The
+// permission calculus decides, and nothing rides over it.
+//
+// Manager is the meta-permission — who may define a DocType and install a module
+// (resolveManager) — and it is NOT a document right. It used to answer true here
+// ahead of the table, which made a DocType unable to withhold anything from the
+// org owner: a row naming System Manager with Read alone granted nothing and
+// withheld nothing, so an append-only trail had a writer after all. A caller
+// holding System Manager still carries it in Roles, so every DocType that names
+// the role still resolves through the same table as every other role.
 //
 // SECURE BY DEFAULT: there is no "empty perms means open" branch — see
 // doctype.Grants. A role-less member of an org is denied.
 func (a Access) Can(dt *doctype.DocType, right string) bool {
-	if a.Manager {
-		return true
-	}
 	return doctype.Grants(dt, a.Roles, right)
 }
 

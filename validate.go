@@ -62,6 +62,17 @@ func (s *Store) validateDoc(ctx context.Context, org string, dt *DocType, in, pr
 			continue
 		}
 
+		// An update keeps what the body does not name. The body says what
+		// CHANGES: a field is cleared by naming it empty, never by leaving it out.
+		// Without this a partial body is a deletion of everything it forgot —
+		// a site keeping its town and losing the panel account an activation
+		// matches on, silently, with a 200 to say so.
+		if !present && prev != nil {
+			if old, held := prev[f.Fieldname]; held {
+				raw, present = old, true
+			}
+		}
+
 		// Default when absent/empty.
 		if doctype.IsEmptyInput(raw, present) {
 			if f.Default != "" {

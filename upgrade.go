@@ -75,23 +75,11 @@ func (s *Store) upgrade() error {
 // has no module column. Reading the shape is the whole version signal — it says
 // what is actually there, which a version counter only claims.
 func (s *Store) stale(ctx context.Context) (bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info('fw_documents')`)
+	cols, err := s.columns(ctx, "fw_documents")
 	if err != nil {
-		return false, fmt.Errorf("upgrade: read schema: %w", err)
+		return false, fmt.Errorf("upgrade: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-	var cols int
-	for rows.Next() {
-		var col string
-		if err := rows.Scan(&col); err != nil {
-			return false, err
-		}
-		cols++
-		if col == "module" {
-			return false, nil
-		}
-	}
-	return cols > 0, rows.Err()
+	return len(cols) > 0 && !cols["module"], nil
 }
 
 // upgradeDocTypes copies every DocType onto the address key, renaming it and

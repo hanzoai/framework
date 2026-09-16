@@ -209,11 +209,17 @@ func (e *Engine) Delete(ctx context.Context, org string, id doctype.ID, name str
 // KB retrieval surface) uses to hydrate search hits or count ingested docs without
 // re-implementing the store query. It is a thin, validated pass-through to
 // ListDocuments — every result is physically scoped to `org`.
+//
+// Most-recently-updated first, which is what ParseListQuery already gives the
+// HTTP list for an unordered query. A caller asking for at most N rows of a
+// table that holds more wants the N that matter, and the other end of the table
+// is a fixed photograph of the day the tenant was installed: a feed that has
+// stopped, a trail that ends before the act being asked about.
 func (e *Engine) Search(ctx context.Context, org string, id doctype.ID, filters map[string]string, limit int) ([]Document, error) {
 	if err := e.ready(); err != nil {
 		return nil, err
 	}
-	return e.store.ListDocuments(ctx, org, id, ListOpts{Filters: filters, Limit: limit})
+	return e.store.ListDocuments(ctx, org, id, ListOpts{Filters: filters, Limit: limit, Desc: true})
 }
 
 // Get returns a single document by name in (org, doctype) — the read-one twin of

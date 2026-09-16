@@ -248,6 +248,9 @@ func (e *Engine) CreateDocument(ctx context.Context, c Caller, id doctype.ID, in
 	if err != nil {
 		return Doc{}, err
 	}
+	if err := fixed(&dt, birth(&dt), in); err != nil {
+		return Doc{}, err
+	}
 	if dt.IsSingle {
 		return e.writeSingle(ctx, acc, &dt, in)
 	}
@@ -342,6 +345,9 @@ func (e *Engine) UpdateDocument(ctx context.Context, c Caller, id doctype.ID, na
 	}
 	if prev.DocStatus != 0 {
 		return Doc{}, fmt.Errorf("%w: document is not a draft (docstatus %d); cannot edit", ErrBadState, prev.DocStatus)
+	}
+	if err := fixed(&dt, carried(&dt, prev.Data), in); err != nil {
+		return Doc{}, err
 	}
 	validated, err := e.store.validateDoc(ctx, acc.Org, &dt, in, prev.Data, name, false)
 	if err != nil {
@@ -533,4 +539,76 @@ func (e *Engine) after(ctx context.Context, org string, dt *DocType, doc, prev *
 func stringField(m map[string]any, key string) string {
 	s, _ := m[key].(string)
 	return strings.TrimSpace(s)
+}
+
+// ---- read-only fields ----
+//
+// A DocType declares a field read-only when the subsystem that owns the DocType
+// maintains it: an incident's state and the stamps its acts leave, the path a
+// camera's credential is kept at, a connector's sync cursor. Those values are
+// written by the code that earns them, through the in-process API. Write rights
+// on a DocType are rights on every document of it and on every field of it, so
+// the generic surface is where the distinction has to be made, and this is where
+// it is made.
+
+// fixed refuses a body that moves a read-only field off the value it is already
+// held at. `was` is that value per field: what the DocType declares before
+// anyone writes a document, and what the document carries once one exists. A
+// field `was` does not name is not held.
+func fixed(dt *DocType, was, in map[string]any) error {
+	for _, f := range dt.Fields {
+		if !f.ReadOnly {
+			continue
+		}
+		hold, held := was[f.Fieldname]
+		sent, named := in[f.Fieldname]
+		if !held || !named {
+			continue
+		}
+		if text(hold) != text(sent) {
+			return doctype.Errorf("field %q is read-only", f.Fieldname)
+		}
+	}
+	return nil
+}
+
+// birth is what a DocType says its read-only fields are before a document
+// exists: the defaults it declares. An incident is born `received`, so a create
+// that lands it `closed` with stamps of its own is asserting a response that no
+// act, no role and no trail produced.
+//
+// A read-only field the DocType declares nothing for is what the create
+// establishes — where a camera's credential is kept is chosen when the camera is
+// registered — and after that it is held by the stored value.
+func birth(dt *DocType) map[string]any {
+	out := make(map[string]any, len(dt.Fields))
+	for _, f := range dt.Fields {
+		if f.ReadOnly && f.Default != "" {
+			out[f.Fieldname] = f.Default
+		}
+	}
+	return out
+}
+
+// carried is what a stored document holds in its read-only fields — every one of
+// them, including the ones never written, so an update establishes none of them
+// either.
+func carried(dt *DocType, prev map[string]any) map[string]any {
+	out := make(map[string]any, len(dt.Fields))
+	for _, f := range dt.Fields {
+		if f.ReadOnly {
+			out[f.Fieldname] = prev[f.Fieldname]
+		}
+	}
+	return out
+}
+
+// text renders a field value as what it compares by. A stored value arrives
+// coerced and a body's does not, an absent field reads as empty, and no
+// read-only field is a structure.
+func text(v any) string {
+	if v == nil {
+		return ""
+	}
+	return fmt.Sprint(v)
 }

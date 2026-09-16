@@ -74,7 +74,48 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(fmt.Sprintf(doctypesDDL, "fw_doctypes") + fmt.Sprintf(documentsDDL, "fw_documents") + indexDDL); err != nil {
 		return fmt.Errorf("framework migrate: %w", err)
 	}
+	return s.widen(context.Background())
+}
+
+// widen adds a column to a table that already exists, which CREATE TABLE IF NOT
+// EXISTS cannot. SQLite adds one in place when it carries a default, and
+// pragma_table_info says whether it is already there — the same shape signal
+// `stale` reads, and what is actually true where a version counter only claims
+// it.
+func (s *Store) widen(ctx context.Context) error {
+	for _, add := range []struct{ table, column, ddl string }{
+		{"fw_doctypes", "immutable", `ALTER TABLE fw_doctypes ADD COLUMN immutable INTEGER NOT NULL DEFAULT 0`},
+	} {
+		cols, err := s.columns(ctx, add.table)
+		if err != nil {
+			return err
+		}
+		if cols[add.column] {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, add.ddl); err != nil {
+			return fmt.Errorf("framework migrate: %s.%s: %w", add.table, add.column, err)
+		}
+	}
 	return nil
+}
+
+// columns is a table's column names, empty for a table that does not exist.
+func (s *Store) columns(ctx context.Context, table string) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return nil, fmt.Errorf("read schema: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]bool{}
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err != nil {
+			return nil, err
+		}
+		out[col] = true
+	}
+	return out, rows.Err()
 }
 
 // The schema, one template per table so the upgrade (upgrade.go) stages the
@@ -88,6 +129,7 @@ CREATE TABLE IF NOT EXISTS %s (
   module         TEXT NOT NULL,
   is_single      INTEGER NOT NULL DEFAULT 0,
   is_submittable INTEGER NOT NULL DEFAULT 0,
+  immutable      INTEGER NOT NULL DEFAULT 0,
   autoname       TEXT NOT NULL DEFAULT '',
   title_field    TEXT NOT NULL DEFAULT '',
   fields         TEXT NOT NULL DEFAULT '[]',
@@ -144,9 +186,9 @@ func (s *Store) CreateDocType(ctx context.Context, org string, dt DocType) (DocT
 	fieldsJSON, _ := json.Marshal(dt.Fields)
 	permsJSON, _ := json.Marshal(dt.Perms)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO fw_doctypes (org,name,module,is_single,is_submittable,autoname,title_field,fields,permissions,created_at,updated_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-		org, dt.Name, dt.Module, b2i(dt.IsSingle), b2i(dt.IsSubmittable), dt.Autoname, dt.TitleField,
+		`INSERT INTO fw_doctypes (org,name,module,is_single,is_submittable,immutable,autoname,title_field,fields,permissions,created_at,updated_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		org, dt.Name, dt.Module, b2i(dt.IsSingle), b2i(dt.IsSubmittable), b2i(dt.Immutable), dt.Autoname, dt.TitleField,
 		string(fieldsJSON), string(permsJSON), now, now)
 	if err != nil {
 		if isUnique(err) {
@@ -159,7 +201,7 @@ func (s *Store) CreateDocType(ctx context.Context, org string, dt DocType) (DocT
 
 func (s *Store) GetDocType(ctx context.Context, org string, id doctype.ID) (DocType, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT name,module,is_single,is_submittable,autoname,title_field,fields,permissions,created_at,updated_at
+		`SELECT name,module,is_single,is_submittable,immutable,autoname,title_field,fields,permissions,created_at,updated_at
 		 FROM fw_doctypes WHERE org=? AND module=? AND name=?`, org, id.Module, id.Name)
 	dt, err := scanDocType(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -181,7 +223,7 @@ func (s *Store) GetDocType(ctx context.Context, org string, id doctype.ID) (DocT
 
 func (s *Store) ListDocTypes(ctx context.Context, org string) ([]DocType, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT name,module,is_single,is_submittable,autoname,title_field,fields,permissions,created_at,updated_at
+		`SELECT name,module,is_single,is_submittable,immutable,autoname,title_field,fields,permissions,created_at,updated_at
 		 FROM fw_doctypes WHERE org=? ORDER BY name ASC`, org)
 	if err != nil {
 		return nil, fmt.Errorf("list doctypes: %w", err)
@@ -222,9 +264,9 @@ func (s *Store) ReplaceDocType(ctx context.Context, org string, dt DocType) (Doc
 	permsJSON, _ := json.Marshal(dt.Perms)
 	now := time.Now().Unix()
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE fw_doctypes SET module=?,is_single=?,is_submittable=?,autoname=?,title_field=?,fields=?,permissions=?,updated_at=?
+		`UPDATE fw_doctypes SET module=?,is_single=?,is_submittable=?,immutable=?,autoname=?,title_field=?,fields=?,permissions=?,updated_at=?
 		 WHERE org=? AND module=? AND name=?`,
-		dt.Module, b2i(dt.IsSingle), b2i(dt.IsSubmittable), dt.Autoname, dt.TitleField,
+		dt.Module, b2i(dt.IsSingle), b2i(dt.IsSubmittable), b2i(dt.Immutable), dt.Autoname, dt.TitleField,
 		string(fieldsJSON), string(permsJSON), now, org, dt.Module, dt.Name)
 	if err != nil {
 		return DocType{}, fmt.Errorf("update doctype: %w", err)
@@ -259,16 +301,17 @@ func (s *Store) DeleteDocType(ctx context.Context, org string, id doctype.ID) (b
 
 func scanDocType(sc interface{ Scan(...any) error }) (DocType, error) {
 	var (
-		dt                    DocType
-		single, submittable   int
-		fieldsJSON, permsJSON string
+		dt                             DocType
+		single, submittable, immutable int
+		fieldsJSON, permsJSON          string
 	)
-	if err := sc.Scan(&dt.Name, &dt.Module, &single, &submittable, &dt.Autoname, &dt.TitleField,
+	if err := sc.Scan(&dt.Name, &dt.Module, &single, &submittable, &immutable, &dt.Autoname, &dt.TitleField,
 		&fieldsJSON, &permsJSON, &dt.CreatedAt, &dt.UpdatedAt); err != nil {
 		return DocType{}, err
 	}
 	dt.IsSingle = single != 0
 	dt.IsSubmittable = submittable != 0
+	dt.Immutable = immutable != 0
 	_ = json.Unmarshal([]byte(fieldsJSON), &dt.Fields)
 	_ = json.Unmarshal([]byte(permsJSON), &dt.Perms)
 	if dt.Fields == nil {
