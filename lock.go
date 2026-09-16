@@ -91,6 +91,26 @@ func (e *Engine) AcquireLease(ctx context.Context, org, key string, ttl, wait ti
 	}
 }
 
+// Holder is the unguessable token this acquisition took the lease under. A
+// release is scoped to it, so a caller that took the lease through another
+// process releases the one it took and never a successor's.
+func (l *Lease) Holder() string {
+	if l == nil {
+		return ""
+	}
+	return l.holder
+}
+
+// ReleaseLease frees the lease on (org, key) held under `holder` — the same
+// holder-scoped release Release performs, for a caller that holds the token
+// rather than the value. A lease already reclaimed by TTL is a no-op.
+func (e *Engine) ReleaseLease(ctx context.Context, org, key, holder string) error {
+	if err := e.ready(); err != nil {
+		return err
+	}
+	return e.store.releaseLock(context.WithoutCancel(ctx), org, key, holder)
+}
+
 // Release frees the lease IFF this holder still owns it. Best-effort and idempotent:
 // a lease already reclaimed by TTL is a no-op (holder-scoped delete), and a store
 // error is returned for the caller to log — never to fail the already-completed work.

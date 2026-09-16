@@ -429,7 +429,13 @@ func (s *Store) GetDocument(ctx context.Context, org string, id doctype.ID, name
 // ListOpts is a parsed, validated list query. Filters keys are declared field
 // names (or the special "name"/"docstatus"); OrderField is a resolved sort key.
 type ListOpts struct {
-	Filters    map[string]string
+	Filters map[string]string
+	// Among is set membership: each named field must hold one of the values
+	// named for it. Equality can only ask about one value, so a question about a
+	// set — the incidents at these sites, in these states — had to be asked once
+	// per value and the answers merged, which is a window per value rather than
+	// the caller's own. A field named with an empty set matches nothing.
+	Among      map[string][]string
 	OrderField string // "" → updated_at
 	Desc       bool
 	Limit      int
@@ -456,6 +462,33 @@ func (s *Store) ListDocuments(ctx context.Context, org string, id doctype.ID, op
 			// json_extract's path arg is a BOUND concatenation — no interpolation.
 			where = append(where, "CAST(json_extract(data,'$.'||?) AS TEXT)=?")
 			args = append(args, field, val)
+		}
+	}
+
+	// Field names in order, so one question is always one query text; every value
+	// is bound, exactly as an equality's is.
+	among := make([]string, 0, len(opts.Among))
+	for field := range opts.Among {
+		among = append(among, field)
+	}
+	sort.Strings(among)
+	for _, field := range among {
+		vals := opts.Among[field]
+		if len(vals) == 0 {
+			return []Document{}, nil
+		}
+		marks := strings.TrimSuffix(strings.Repeat("?,", len(vals)), ",")
+		switch field {
+		case "name":
+			where = append(where, "name IN ("+marks+")")
+		case "docstatus":
+			where = append(where, "docstatus IN ("+marks+")")
+		default:
+			where = append(where, "CAST(json_extract(data,'$.'||?) AS TEXT) IN ("+marks+")")
+			args = append(args, field)
+		}
+		for _, v := range vals {
+			args = append(args, v)
 		}
 	}
 

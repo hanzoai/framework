@@ -104,15 +104,38 @@ func (e *Engine) DocTypeOf(ctx context.Context, c Caller, id doctype.ID) (DocTyp
 	return e.store.GetDocType(ctx, acc.Org, id)
 }
 
+// ours refuses a definition that belongs to a module rather than to the org.
+//
+// What a fixture declares — its fields, its permission table, and whether it is
+// Immutable — is the subsystem's, which writes each document once through the
+// in-process API while every role reads. A replace is the whole definition, so an
+// org's own System Manager could drop Immutable and add a write grant and then
+// rewrite an act trail; a delete takes the definition and every document under it
+// together, which shortens what happened to nothing. Neither is a right over a
+// record an insurer and a court read, and no permission row can say so, because a
+// row speaks about a role and this is a property of the record.
+//
+// A DocType the org itself defined is still its own to replace and to remove.
+func ours(id doctype.ID) error {
+	if declares(id.Module, id.Name) {
+		return fmt.Errorf("%w: %s is declared by module %q", ErrForbidden, id, id.Module)
+	}
+	return nil
+}
+
 // ReplaceDocType replaces a DocType definition (PUT semantics). `id` is
 // authoritative over the body's own module and name, so a host's URL always wins.
-// Documents already stored under it are left intact. Manager-only.
+// Documents already stored under it are left intact. Manager-only, and never a
+// DocType a module declares.
 func (e *Engine) ReplaceDocType(ctx context.Context, c Caller, id doctype.ID, dt DocType) (DocType, error) {
 	if err := e.ready(); err != nil {
 		return DocType{}, err
 	}
 	acc, err := e.resolveManager(ctx, c)
 	if err != nil {
+		return DocType{}, err
+	}
+	if err := ours(id); err != nil {
 		return DocType{}, err
 	}
 	dt.Module, dt.Name = id.Module, id.Name
@@ -122,13 +145,17 @@ func (e *Engine) ReplaceDocType(ctx context.Context, c Caller, id doctype.ID, dt
 	return e.store.ReplaceDocType(ctx, acc.Org, dt)
 }
 
-// DeleteDocType removes a DocType and all of its documents. Manager-only.
+// DeleteDocType removes a DocType and all of its documents. Manager-only, and
+// never a DocType a module declares.
 func (e *Engine) DeleteDocType(ctx context.Context, c Caller, id doctype.ID) error {
 	if err := e.ready(); err != nil {
 		return err
 	}
 	acc, err := e.resolveManager(ctx, c)
 	if err != nil {
+		return err
+	}
+	if err := ours(id); err != nil {
 		return err
 	}
 	deleted, err := e.store.DeleteDocType(ctx, acc.Org, id)
@@ -248,11 +275,11 @@ func (e *Engine) CreateDocument(ctx context.Context, c Caller, id doctype.ID, in
 	if err != nil {
 		return Doc{}, err
 	}
-	if err := fixed(&dt, birth(&dt), in); err != nil {
-		return Doc{}, err
-	}
 	if dt.IsSingle {
 		return e.writeSingle(ctx, acc, &dt, in)
+	}
+	if err := fixed(&dt, birth(&dt), in); err != nil {
+		return Doc{}, err
 	}
 	validated, err := e.store.validateDoc(ctx, acc.Org, &dt, in, nil, "", false)
 	if err != nil {
@@ -482,9 +509,10 @@ func (e *Engine) single(ctx context.Context, org string, dt *DocType) (Document,
 
 // writeSingle upserts the ONE document of a Single DocType (name == doctype
 // name), used by both create and update. It enforces the SAME immutability as
-// the normal path — a submitted/cancelled Single is not editable — and
-// preserves a redacted Password across an unchanged update by passing the
-// current data as `prev` to the validator.
+// the normal path — a submitted/cancelled Single is not editable, and a
+// read-only field is held at what it is already held at — and preserves a
+// redacted Password across an unchanged update by passing the current data as
+// `prev` to the validator.
 func (e *Engine) writeSingle(ctx context.Context, acc Access, dt *DocType, in map[string]any) (Doc, error) {
 	cur, curErr := e.store.GetDocument(ctx, acc.Org, dt.ID(), dt.Name)
 	var prev map[string]any
@@ -495,6 +523,17 @@ func (e *Engine) writeSingle(ctx context.Context, acc Access, dt *DocType, in ma
 		prev = cur.Data
 	} else if !errors.Is(curErr, ErrNotFound) {
 		return Doc{}, curErr
+	}
+	// A Single is created and updated by the same write, so the hold on its
+	// read-only fields is here rather than at either caller: what the DocType
+	// declares before the one document exists, and what that document carries
+	// once it does.
+	was := birth(dt)
+	if prev != nil {
+		was = carried(dt, prev)
+	}
+	if err := fixed(dt, was, in); err != nil {
+		return Doc{}, err
 	}
 	validated, err := e.store.validateDoc(ctx, acc.Org, dt, in, prev, dt.Name, false)
 	if err != nil {
@@ -589,6 +628,12 @@ func fixed(dt *DocType, was, in map[string]any) error {
 // A read-only field the DocType declares nothing for is what the create
 // establishes — where a camera's credential is kept is chosen when the camera is
 // registered — and after that it is held by the stored value.
+//
+// So such a field is the CREATE's to choose, and a DocType that also makes it
+// Unique has made it first-come: the first create to name a value owns it for
+// the org, and every later one is refused. That is correct where the subsystem
+// supplies the value and a register to squat where the caller does, which is the
+// question to ask of every ReadOnly field carrying no default.
 func birth(dt *DocType) map[string]any {
 	out := make(map[string]any, len(dt.Fields))
 	for _, f := range dt.Fields {
