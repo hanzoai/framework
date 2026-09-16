@@ -12,6 +12,10 @@ import (
 // writer and no remover at all — not even the org owner, whose System Manager
 // role is now read through the same permission table as every other role.
 
+// sudo is the platform identity acting inside one org — cross-tenant scope, not
+// a second tenant.
+func sudo(org string) Caller { return Caller{Org: org, User: "root", IsAdmin: true} }
+
 // ledgerDT is a record a machine writes and people read: a state it is born in,
 // a stamp its own code lands, a note nobody maintains, and a body field.
 func ledgerDT() DocType {
@@ -133,7 +137,7 @@ func TestImmutableHasNoWriterAndNoRemover(t *testing.T) {
 	if err := e.DeleteDocument(context.Background(), owner("acme"), id, made.Name); err == nil {
 		t.Error("the org owner removed a document of an immutable DocType")
 	}
-	if err := e.DeleteDocument(context.Background(), admin(), id, made.Name); err == nil {
+	if err := e.DeleteDocument(context.Background(), sudo("acme"), id, made.Name); err == nil {
 		t.Error("a platform superuser removed a document of an immutable DocType")
 	}
 	if _, err := e.GetDocument(context.Background(), owner("acme"), id, made.Name); err != nil {
@@ -160,5 +164,23 @@ func TestAPermissionTableWithholdsFromTheOrgOwner(t *testing.T) {
 	}
 	if _, err := e.GetDocument(context.Background(), owner("acme"), id, made.Name); err != nil {
 		t.Errorf("the read the table does grant was refused: %v", err)
+	}
+}
+
+// TestSudoOverridesTheTableAndNotTheRecord: platform sudo is the one
+// cross-tenant identity and overrides a DocType's permission table; it is not an
+// exception to what a record IS, so an immutable one refuses it too.
+func TestSudoOverridesTheTableAndNotTheRecord(t *testing.T) {
+	e := testEngine(t)
+	dt := ledgerDT()
+	dt.Perms = []DocPerm{{Role: RoleSystemManager, Read: true}}
+	seed(t, e, "acme", dt)
+	id := at("ledger", "Entry")
+	made, err := e.Ingest(context.Background(), "acme", id, map[string]any{"memo": "act"}, "")
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := e.DeleteDocument(context.Background(), sudo("acme"), id, made.Name); err != nil {
+		t.Fatalf("platform sudo was held to a per-DocType table: %v", err)
 	}
 }

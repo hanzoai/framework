@@ -19,30 +19,47 @@ import (
 // path.
 
 // Access is a resolved caller: the validated tenant, their identity, their
-// effective role set, and whether they are a manager (a platform superuser, an
-// explicit System Manager, or the trust-on-first-use org owner).
+// effective role set, and the two scopes above the roles.
+//
+// The two are not one. Manager is org-scoped — a caller IAM gave System Manager
+// in THIS org — and Super is the platform's own cross-tenant identity. Holding
+// them as one value made an org's own administrator into platform sudo, which is
+// the escalation the scopes exist to keep apart.
 type Access struct {
-	Org     string
-	User    string
-	Roles   map[string]bool
+	Org   string
+	User  string
+	Roles map[string]bool
+	// Manager may define DocTypes and install modules in this org. That is the
+	// META-permission — what the schema itself is — and it is not a right on any
+	// document.
 	Manager bool
+	// Super is the platform's cross-tenant identity, which overrides a DocType's
+	// permission table. An org's own System Manager does not: a DocType that
+	// withholds a right from the role withholds it.
+	Super bool
 }
 
-// Can reports whether the caller may perform `right` on a document of dt. The
-// permission calculus decides, and nothing rides over it.
+// Can reports whether the caller may perform `right` on a document of dt.
 //
-// Manager is the meta-permission — who may define a DocType and install a module
-// (resolveManager) — and it is NOT a document right. It used to answer true here
-// ahead of the table, which made a DocType unable to withhold anything from the
-// org owner: a row naming System Manager with Read alone granted nothing and
+// Three questions in order. Does the DocType admit the right at all — an
+// immutable record has no writer and no remover, and platform sudo is not an
+// exception to what a record IS. Is the caller platform sudo, which overrides a
+// permission table. Otherwise the calculus decides.
+//
+// Manager is absent from that list on purpose. It used to answer true ahead of
+// the table, which left a DocType unable to withhold anything from its own org's
+// administrator: a row naming System Manager with Read alone granted nothing and
 // withheld nothing, so an append-only trail had a writer after all. A caller
-// holding System Manager still carries it in Roles, so every DocType that names
-// the role still resolves through the same table as every other role.
+// holding System Manager still carries the role, so every DocType that names it
+// resolves through the same table as every other role.
 //
 // SECURE BY DEFAULT: there is no "empty perms means open" branch — see
 // doctype.Grants. A role-less member of an org is denied.
 func (a Access) Can(dt *doctype.DocType, right string) bool {
-	return doctype.Grants(dt, a.Roles, right)
+	if !doctype.Admits(dt, right) {
+		return false
+	}
+	return a.Super || doctype.Grants(dt, a.Roles, right)
 }
 
 // resolve turns a Caller into an Access by reading the caller's per-org roles.
@@ -54,9 +71,9 @@ func (e *Engine) resolve(_ context.Context, c Caller) (Access, error) {
 	}
 	acc := Access{Org: c.Org, User: c.User, Roles: map[string]bool{doctype.RoleAll: true}}
 
-	// A platform superuser is a manager everywhere.
+	// A platform superuser is both scopes everywhere.
 	if c.IsAdmin {
-		acc.Manager = true
+		acc.Manager, acc.Super = true, true
 		acc.Roles[doctype.RoleSystemManager] = true
 		return acc, nil
 	}

@@ -31,6 +31,8 @@ github.com/hanzoai/doctype v0.1.2 h1:zDw5VC7eCkyoWTIxj+HkojerAz/MsDbr3QGPlBIEexw
 github.com/hanzoai/doctype v0.1.2/go.mod h1:DmN5to9CcSI0a1PvSeowD70UgFPzsT80BFPKWlrU3Oc=
 github.com/hanzoai/doctype v0.1.4 h1:qdP6MxYWrKkR4uS2p1YEja96XAZ/ML7nn8TZNxt3Ehs=
 github.com/hanzoai/doctype v0.1.4/go.mod h1:S9YkPIrUkguftSd+U1Nvrs5jdZPZOGWjBge/oR3RL/8=
+github.com/hanzoai/doctype v0.1.5 h1:XIAptchNJfUrTngaJCiI8iRda0FlSyv5/4eVMczGLNc=
+github.com/hanzoai/doctype v0.1.5/go.mod h1:S9YkPIrUkguftSd+U1Nvrs5jdZPZOGWjBge/oR3RL/8=
 github.com/hanzoai/sqlcipher v0.1.1 h1:GARjSiUEa1lwhd1/f87XRaujZBG5s1ZwxrZW2Es/ADI=
 github.com/hanzoai/sqlcipher v0.1.1/go.mod h1:F0soUYM1i4sawOZUpRvVnWoUayPbeGVlGq01VXy9Aqg=
 github.com/hanzoai/sqlite v0.4.0 h1:xlF6w6xzn2VSeAVBKFrZfIq0ISqRSTHz2g3QN3eCcnE=

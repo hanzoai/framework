@@ -3,7 +3,7 @@ module github.com/hanzoai/framework
 go 1.26.8
 
 require (
-	github.com/hanzoai/doctype v0.1.4
+	github.com/hanzoai/doctype v0.1.5
 	github.com/hanzoai/sqlite v0.4.0
 	github.com/luxfi/log v1.6.0
 )

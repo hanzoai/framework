@@ -565,8 +565,17 @@ func fixed(dt *DocType, was, in map[string]any) error {
 		if !held || !named {
 			continue
 		}
+		// What the value would BECOME, not how it was spelled. A Datetime reads
+		// back in the engine's own layout and a console PUTs the whole document
+		// back as RFC3339; the same instant in two spellings is one value, and
+		// refusing it would make a full-document write impossible on any DocType
+		// carrying a read-only field. A value that does not coerce at all is
+		// compared as it came and refused by the validator, which says why.
+		if val, err := doctype.Coerce(f, sent); err == nil {
+			sent = val
+		}
 		if text(hold) != text(sent) {
-			return doctype.Errorf("field %q is read-only", f.Fieldname)
+			return fmt.Errorf("%w: field %q is read-only", ErrForbidden, f.Fieldname)
 		}
 	}
 	return nil
