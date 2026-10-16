@@ -574,6 +574,60 @@ func TestOps_InstallGrowsAnOlderDefinition(t *testing.T) {
 	}
 }
 
+// A module's DocType is the module's from the start: an org cannot define it for
+// itself ahead of the install, which would let it choose the definition the
+// module's records are kept under.
+func TestOps_DefineRefusesAModulesDocType(t *testing.T) {
+	e := testEngine(t)
+	ctx := context.Background()
+	doctype.ResetModules()
+	t.Cleanup(doctype.ResetModules)
+	RegisterModule("trail", []DocType{{Name: "Act", Immutable: true, Fields: []DocField{
+		{Fieldname: "what", Fieldtype: FieldData},
+	}}})
+	_, err := e.DefineDocType(ctx, owner("acme"), DocType{Name: "Act", Module: "trail", Fields: []DocField{
+		{Fieldname: "what", Fieldtype: FieldData},
+	}})
+	if !errors.Is(err, ErrForbidden) {
+		t.Fatalf("defining a module's DocType = %v, want forbidden", err)
+	}
+	if _, err := e.DefineDocType(ctx, owner("acme"), DocType{Name: "Note", Module: "trail", Fields: []DocField{
+		{Fieldname: "body", Fieldtype: FieldData},
+	}}); err != nil {
+		t.Fatalf("an org's own DocType beside the module's: %v", err)
+	}
+}
+
+// A field a module now requires with no default is grown optional, so a document
+// stored before it still updates.
+func TestOps_GrowingARequiredFieldKeepsOldDocumentsWritable(t *testing.T) {
+	e := testEngine(t)
+	ctx := context.Background()
+	doctype.ResetModules()
+	t.Cleanup(doctype.ResetModules)
+	c := owner("acme")
+	widget := at("shop", "Widget")
+	RegisterModule("shop", []DocType{{Name: "Widget", Fields: []DocField{{Fieldname: "sku", Fieldtype: FieldData}}}})
+	if _, err := e.InstallModule(ctx, c, "shop"); err != nil {
+		t.Fatalf("install v1: %v", err)
+	}
+	old, err := e.CreateDocument(ctx, c, widget, map[string]any{"sku": "W-1"})
+	if err != nil {
+		t.Fatalf("create on v1: %v", err)
+	}
+	doctype.ResetModules()
+	RegisterModule("shop", []DocType{{Name: "Widget", Fields: []DocField{
+		{Fieldname: "sku", Fieldtype: FieldData},
+		{Fieldname: "owner_email", Fieldtype: FieldData, Reqd: true},
+	}}})
+	if _, err := e.InstallModule(ctx, c, "shop"); err != nil {
+		t.Fatalf("install v2: %v", err)
+	}
+	if _, err := e.UpdateDocument(ctx, c, widget, old.Name, map[string]any{"sku": "W-1b"}); err != nil {
+		t.Fatalf("the document stored before the required field: %v", err)
+	}
+}
+
 // ---- summary ----
 
 func TestOps_Summary(t *testing.T) {

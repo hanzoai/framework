@@ -67,13 +67,18 @@ type Install struct {
 
 // ---- DocType registry ----
 
-// DefineDocType creates a DocType in the caller's org. Manager-only.
+// DefineDocType creates a DocType in the caller's org. Manager-only, and never a
+// DocType a module declares: that one is the module's, and an org gets it by
+// installing the module (see ours).
 func (e *Engine) DefineDocType(ctx context.Context, c Caller, dt DocType) (DocType, error) {
 	if err := e.ready(); err != nil {
 		return DocType{}, err
 	}
 	acc, err := e.resolveManager(ctx, c)
 	if err != nil {
+		return DocType{}, err
+	}
+	if err := ours(dt.ID()); err != nil {
 		return DocType{}, err
 	}
 	if err := dt.Validate(); err != nil {
@@ -275,7 +280,9 @@ func (e *Engine) InstallModule(ctx context.Context, c Caller, module string) (In
 }
 
 // missing is the fields a fixture declares that a stored definition lacks, by
-// fieldname, in the fixture's order.
+// fieldname, in the fixture's order. A grown field the fixture requires and gives
+// no default is grown optional: every document stored before it has no value for
+// it, and requiring one would refuse each of those documents' next update.
 func missing(held, fx DocType) []DocField {
 	have := make(map[string]bool, len(held.Fields))
 	for _, f := range held.Fields {
@@ -283,9 +290,13 @@ func missing(held, fx DocType) []DocField {
 	}
 	var out []DocField
 	for _, f := range fx.Fields {
-		if !have[f.Fieldname] {
-			out = append(out, f)
+		if have[f.Fieldname] {
+			continue
 		}
+		if f.Reqd && f.Default == "" {
+			f.Reqd = false
+		}
+		out = append(out, f)
 	}
 	return out
 }
