@@ -517,6 +517,63 @@ func TestOps_Modules(t *testing.T) {
 	}
 }
 
+// A lane that adds a field reaches the orgs that installed it before: install
+// grows the stored definition by the fields it lacks, keeps every stored field
+// and document as it was, and grows nothing a second time.
+func TestOps_InstallGrowsAnOlderDefinition(t *testing.T) {
+	e := testEngine(t)
+	ctx := context.Background()
+	doctype.ResetModules()
+	t.Cleanup(doctype.ResetModules)
+	c := owner("acme")
+	widget := at("shop", "Widget")
+
+	RegisterModule("shop", []DocType{{Name: "Widget", Fields: []DocField{
+		{Fieldname: "sku", Fieldtype: FieldData, Label: "SKU"},
+	}}})
+	if _, err := e.InstallModule(ctx, c, "shop"); err != nil {
+		t.Fatalf("install v1: %v", err)
+	}
+	doc, err := e.CreateDocument(ctx, c, widget, map[string]any{"sku": "W-1", "price": "9"})
+	if err != nil {
+		t.Fatalf("create on v1: %v", err)
+	}
+	if _, held := doc.Data["price"]; held {
+		t.Fatalf("v1 stored a field it does not declare: %v", doc.Data)
+	}
+
+	// The lane's next release declares price, and relabels sku: install adds the
+	// one and leaves the stored other as it is.
+	doctype.ResetModules()
+	RegisterModule("shop", []DocType{{Name: "Widget", Fields: []DocField{
+		{Fieldname: "sku", Fieldtype: FieldData, Label: "Stock Unit"},
+		{Fieldname: "price", Fieldtype: FieldData, Label: "Price"},
+	}}})
+	ins, err := e.InstallModule(ctx, c, "shop")
+	if err != nil || len(ins.Created) != 0 || len(ins.Existing) != 1 || len(ins.Grown) != 1 || ins.Grown[0] != "Widget" {
+		t.Fatalf("install v2 = %+v, %v; want Widget existing and grown", ins, err)
+	}
+	dt, err := e.DocTypeOf(ctx, c, widget)
+	if err != nil || len(dt.Fields) != 2 || dt.Fields[0].Label != "SKU" || dt.Fields[1].Fieldname != "price" {
+		t.Fatalf("grown definition = %+v, %v; want sku as stored, then price", dt.Fields, err)
+	}
+	got, err := e.GetDocument(ctx, c, widget, doc.Name)
+	if err != nil || got.Data["sku"] != "W-1" {
+		t.Fatalf("the document stored on v1 = %+v, %v", got, err)
+	}
+	if _, err := e.CreateDocument(ctx, c, widget, map[string]any{"sku": "W-2", "price": "9"}); err != nil {
+		t.Fatalf("create on v2: %v", err)
+	}
+	again, err := e.InstallModule(ctx, c, "shop")
+	if err != nil || len(again.Grown) != 0 {
+		t.Fatalf("a third install grew %v (%v); want nothing", again.Grown, err)
+	}
+	// Another org's install is its own.
+	if _, err := e.DocTypeOf(ctx, owner("orgB"), widget); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("growing acme's definition reached orgB: %v", err)
+	}
+}
+
 // ---- summary ----
 
 func TestOps_Summary(t *testing.T) {

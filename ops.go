@@ -60,6 +60,9 @@ type Install struct {
 	Module   string   `json:"module"`
 	Created  []string `json:"created"`
 	Existing []string `json:"existing"`
+	// Grown names the existing DocTypes that gained the fields the module now
+	// declares and the org's stored definition lacked.
+	Grown []string `json:"grown"`
 }
 
 // ---- DocType registry ----
@@ -214,9 +217,16 @@ func (e *Engine) ModuleOf(ctx context.Context, c Caller, module string) (ModuleS
 }
 
 // InstallModule ensures every registered DocType of a lane exists in the
-// caller's org. Idempotent (create-if-absent — an org's customized DocType is
-// NEVER clobbered) and manager-only, so an owner installs a lane into their OWN
-// tenant and no one else's.
+// caller's org, with every field the lane declares. Idempotent and manager-only,
+// so an owner installs a lane into their OWN tenant and no one else's.
+//
+// A DocType the org already holds is never replaced. It only GROWS: a field the
+// lane declares and the stored definition lacks is appended, and nothing stored
+// is removed or altered. That is how a lane that adds a field reaches the orgs
+// that installed it earlier — the definition is the module's (an org cannot
+// replace it, see ours), so the stored copy is the module's as of its install,
+// and without this it would hold that shape for good while the lane's code
+// writes fields the store silently drops.
 func (e *Engine) InstallModule(ctx context.Context, c Caller, module string) (Install, error) {
 	if err := e.ready(); err != nil {
 		return Install{}, err
@@ -230,10 +240,20 @@ func (e *Engine) InstallModule(ctx context.Context, c Caller, module string) (In
 	if len(fx) == 0 {
 		return Install{}, fmt.Errorf("%w: unknown module: %s", ErrNotFound, module)
 	}
-	res := Install{Module: module, Created: []string{}, Existing: []string{}}
+	res := Install{Module: module, Created: []string{}, Existing: []string{}, Grown: []string{}}
 	for _, dt := range fx {
 		dt.Module = module // the lane owns the module tag, and it is half the key
-		if _, err := e.store.GetDocType(ctx, acc.Org, dt.ID()); err == nil {
+		if held, err := e.store.GetDocType(ctx, acc.Org, dt.ID()); err == nil {
+			if more := missing(held, dt); len(more) > 0 {
+				held.Fields = append(held.Fields, more...)
+				if err := held.Validate(); err != nil {
+					return Install{}, fmt.Errorf("fixture %q grown invalid: %w", dt.Name, err)
+				}
+				if _, err := e.store.ReplaceDocType(ctx, acc.Org, held); err != nil {
+					return Install{}, err
+				}
+				res.Grown = append(res.Grown, dt.Name)
+			}
 			res.Existing = append(res.Existing, dt.Name)
 			continue
 		} else if !errors.Is(err, ErrNotFound) {
@@ -252,6 +272,22 @@ func (e *Engine) InstallModule(ctx context.Context, c Caller, module string) (In
 		res.Created = append(res.Created, dt.Name)
 	}
 	return res, nil
+}
+
+// missing is the fields a fixture declares that a stored definition lacks, by
+// fieldname, in the fixture's order.
+func missing(held, fx DocType) []DocField {
+	have := make(map[string]bool, len(held.Fields))
+	for _, f := range held.Fields {
+		have[f.Fieldname] = true
+	}
+	var out []DocField
+	for _, f := range fx.Fields {
+		if !have[f.Fieldname] {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func fixtureNames(fx []DocType) []string {
