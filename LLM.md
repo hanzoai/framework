@@ -107,6 +107,24 @@ render(doc.Wire(nil))
 `Classify` is the ONE place that decides what a failure means. A host switches
 on the `Code` and never on a message, so hosts cannot drift.
 
+## A module's DocType resolves as the module is now
+
+A DocType a module declares is the module's: an org cannot define or replace it
+(`ours`), so the row an install stores is only the module's shape on install day.
+`Store.GetDocType` therefore resolves that row grown by every field the module now
+declares and the row lacks (`current`, the same `missing` an install appends, a
+required field grown optional), and a DocType the module added later resolves from
+the fixture for any org that holds one of the module's DocTypes. `ListDocTypes`
+answers the same. Nothing is written on resolve; `InstallModule` reads the raw row
+(`stored`) and still persists and reports what it grows.
+
+Why: `validateDoc` keeps only declared fields, so before this a release that added
+a field to a module wrote it nowhere in every org that had installed the module
+earlier, with no error. Measured in Hanzo's own CRM: crm.lead dropped program,
+answers, offer and the utm tags from every public form for weeks. An always-on
+module's stored row is the exception: no install writes one, so it is the org's
+customization and wins whole. Gate: `TestOps_ResolveIsTheModuleAsItIsNow`.
+
 ## Tenant isolation (the security boundary)
 
 Every `fw_*` table carries an `org` column and every query filters `WHERE org=?`,

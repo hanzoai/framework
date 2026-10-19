@@ -574,6 +574,72 @@ func TestOps_InstallGrowsAnOlderDefinition(t *testing.T) {
 	}
 }
 
+// A field a module adds reaches every org that holds the module the moment the
+// module declares it, with no install: a write keeps it, and the definition and the
+// listing name it. A DocType the module adds resolves the same way, and only for an
+// org that holds the module.
+func TestOps_ResolveIsTheModuleAsItIsNow(t *testing.T) {
+	e := testEngine(t)
+	ctx := context.Background()
+	doctype.ResetModules()
+	t.Cleanup(doctype.ResetModules)
+	c := owner("acme")
+	widget, gadget := at("shop", "Widget"), at("shop", "Gadget")
+
+	RegisterModule("shop", []DocType{{Name: "Widget", Fields: []DocField{
+		{Fieldname: "sku", Fieldtype: FieldData, Label: "SKU"},
+	}}})
+	if _, err := e.InstallModule(ctx, c, "shop"); err != nil {
+		t.Fatalf("install v1: %v", err)
+	}
+
+	doctype.ResetModules()
+	RegisterModule("shop", []DocType{
+		{Name: "Widget", Fields: []DocField{
+			{Fieldname: "sku", Fieldtype: FieldData, Label: "Stock Unit"},
+			{Fieldname: "price", Fieldtype: FieldData, Label: "Price"},
+			{Fieldname: "answers", Fieldtype: FieldJSON, Label: "Answers"},
+		}},
+		{Name: "Gadget", Fields: []DocField{{Fieldname: "kind", Fieldtype: FieldData}}},
+	})
+	doc, err := e.CreateDocument(ctx, c, widget, map[string]any{
+		"sku": "W-1", "price": "9", "answers": []any{map[string]any{"question": "q", "answer": "a"}},
+	})
+	if err != nil {
+		t.Fatalf("create on v2 with no install: %v", err)
+	}
+	got, err := e.GetDocument(ctx, c, widget, doc.Name)
+	if err != nil || got.Data["price"] != "9" || got.Data["answers"] == nil {
+		t.Fatalf("the fields v2 declares were dropped: %+v, %v", got.Data, err)
+	}
+	dt, err := e.DocTypeOf(ctx, c, widget)
+	if err != nil || len(dt.Fields) != 3 || dt.Fields[0].Label != "SKU" || dt.Fields[2].Fieldname != "answers" {
+		t.Fatalf("resolved definition = %+v, %v; want sku as stored, then price and answers", dt.Fields, err)
+	}
+	if _, err := e.CreateDocument(ctx, c, gadget, map[string]any{"kind": "small"}); err != nil {
+		t.Fatalf("a DocType the module added, in an org holding the module: %v", err)
+	}
+	all, err := e.ListDocTypes(ctx, c)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	listed := map[string]int{}
+	for _, d := range all {
+		listed[d.Name] = len(d.Fields)
+	}
+	if listed["Widget"] != 3 || listed["Gadget"] != 1 {
+		t.Fatalf("listing = %v; want Widget with 3 fields and Gadget", listed)
+	}
+	if _, err := e.DocTypeOf(ctx, owner("orgB"), gadget); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("an org that never installed the module resolved its DocType: %v", err)
+	}
+	// The install still writes what resolve already answered, once.
+	ins, err := e.InstallModule(ctx, c, "shop")
+	if err != nil || len(ins.Grown) != 1 || len(ins.Created) != 1 || ins.Created[0] != "Gadget" {
+		t.Fatalf("install after resolve = %+v, %v; want Widget grown and Gadget created", ins, err)
+	}
+}
+
 // A module's DocType is the module's from the start: an org cannot define it for
 // itself ahead of the install, which would let it choose the definition the
 // module's records are kept under.

@@ -199,12 +199,21 @@ func (s *Store) CreateDocType(ctx context.Context, org string, dt DocType) (DocT
 	return dt, nil
 }
 
+// GetDocType resolves a DocType for an org: the definition the org holds, and for a
+// DocType a module declares, the module's as it is now.
+//
+// A module's definition is the module's (an org cannot replace it, see ours), so a
+// stored copy is only the module's shape as of the org's install. Resolving the
+// stored copy alone held that shape for good, and every field the module added
+// since was dropped from each write with no error: an org's crm.lead went on
+// discarding program, answers and the campaign tags for weeks. So the copy is
+// resolved grown by every field the module now declares and it lacks (the same
+// `missing` an install appends), and a DocType a module added after the org
+// installed it resolves from the fixture once the org holds any of the module's
+// DocTypes. Nothing is written here; an install still persists the grown copy.
 func (s *Store) GetDocType(ctx context.Context, org string, id doctype.ID) (DocType, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT name,module,is_single,is_submittable,immutable,autoname,title_field,fields,permissions,created_at,updated_at
-		 FROM fw_doctypes WHERE org=? AND module=? AND name=?`, org, id.Module, id.Name)
-	dt, err := scanDocType(row)
-	if errors.Is(err, sql.ErrNoRows) {
+	dt, err := s.stored(ctx, org, id)
+	if errors.Is(err, ErrNotFound) {
 		// No stored (per-org) definition. An always-on module's fixture resolves
 		// virtually so a fresh org uses the lane without a per-org install. Only the
 		// DocType DEFINITION resolves this way — every document row stays physically
@@ -213,12 +222,81 @@ func (s *Store) GetDocType(ctx context.Context, org string, id doctype.ID) (DocT
 		if fx, ok := doctype.AlwaysOn(id); ok {
 			return fx, nil
 		}
+		if fx, ok := fixture(id); ok {
+			held, err := s.holds(ctx, org, id.Module)
+			if err != nil {
+				return DocType{}, err
+			}
+			if held {
+				return fx, nil
+			}
+		}
+		return DocType{}, ErrNotFound
+	}
+	if err != nil {
+		return DocType{}, err
+	}
+	return current(dt), nil
+}
+
+// stored is the definition the org's row holds, exactly as written.
+func (s *Store) stored(ctx context.Context, org string, id doctype.ID) (DocType, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT name,module,is_single,is_submittable,immutable,autoname,title_field,fields,permissions,created_at,updated_at
+		 FROM fw_doctypes WHERE org=? AND module=? AND name=?`, org, id.Module, id.Name)
+	dt, err := scanDocType(row)
+	if errors.Is(err, sql.ErrNoRows) {
 		return DocType{}, ErrNotFound
 	}
 	if err != nil {
 		return DocType{}, fmt.Errorf("get doctype: %w", err)
 	}
 	return dt, nil
+}
+
+// holds reports whether the org has installed the module: it stores at least one
+// of the module's DocTypes.
+func (s *Store) holds(ctx context.Context, org, module string) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM fw_doctypes WHERE org=? AND module=? LIMIT 1`, org, module).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("module held: %w", err)
+	}
+	return true, nil
+}
+
+// fixture is the module's declaration of id, stamped with its module and
+// normalized, as an install would store it.
+func fixture(id doctype.ID) (DocType, bool) {
+	for _, dt := range doctype.Fixtures(id.Module) {
+		if dt.Name == id.Name {
+			dt.Module = id.Module
+			dt.Fields = append([]DocField(nil), dt.Fields...)
+			dt.Perms = append([]DocPerm(nil), dt.Perms...)
+			dt.Normalize()
+			return dt, true
+		}
+	}
+	return DocType{}, false
+}
+
+// current is a stored definition with every field its module now declares and it
+// lacks appended. An org's own DocType, which no module declares, is as stored, and
+// so is a stored copy of an always-on module's DocType: no install writes one, so it
+// is the org's customization and wins whole (always_on_test.go).
+func current(dt DocType) DocType {
+	if _, on := doctype.AlwaysOn(dt.ID()); on {
+		return dt
+	}
+	if fx, ok := fixture(dt.ID()); ok {
+		if more := missing(dt, fx); len(more) > 0 {
+			dt.Fields = append(append([]DocField(nil), dt.Fields...), more...)
+		}
+	}
+	return dt
 }
 
 func (s *Store) ListDocTypes(ctx context.Context, org string) ([]DocType, error) {
@@ -236,11 +314,25 @@ func (s *Store) ListDocTypes(ctx context.Context, org string) ([]DocType, error)
 		if err != nil {
 			return nil, fmt.Errorf("scan doctype: %w", err)
 		}
-		out = append(out, dt)
+		out = append(out, current(dt))
 		seen[dt.ID()] = true
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	// A DocType a module declares and the org lacks lists once the org holds the
+	// module, as GetDocType resolves it.
+	held := map[string]bool{}
+	for _, dt := range out {
+		held[dt.Module] = true
+	}
+	for m := range held {
+		for _, fx := range doctype.Fixtures(m) {
+			if dt, ok := fixture(doctype.ID{Module: m, Name: fx.Name}); ok && !seen[dt.ID()] {
+				out = append(out, dt)
+				seen[dt.ID()] = true
+			}
+		}
 	}
 	// Union the always-on fixtures this org has NOT customized (a stored row wins), so
 	// the listing matches GetDocType. Then re-sort by name to preserve the ORDER BY

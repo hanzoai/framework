@@ -248,7 +248,7 @@ func (e *Engine) InstallModule(ctx context.Context, c Caller, module string) (In
 	res := Install{Module: module, Created: []string{}, Existing: []string{}, Grown: []string{}}
 	for _, dt := range fx {
 		dt.Module = module // the lane owns the module tag, and it is half the key
-		if held, err := e.store.GetDocType(ctx, acc.Org, dt.ID()); err == nil {
+		if held, err := e.store.stored(ctx, acc.Org, dt.ID()); err == nil {
 			if more := missing(held, dt); len(more) > 0 {
 				held.Fields = append(held.Fields, more...)
 				if err := held.Validate(); err != nil {
