@@ -531,6 +531,22 @@ type ListOpts struct {
 	OrderField string // "" → updated_at
 	Desc       bool
 	Limit      int
+
+	// After is a keyset cursor: the last row returned on the previous page, used
+	// to fetch the page that follows it without repeating or skipping a row. Its
+	// shape depends on the order key: for the default ordering (updated_at DESC,
+	// name DESC as tie-break) both fields are set; for name ordering only Name
+	// is. The zero value means the first page.
+	After After
+}
+
+// After is a keyset cursor: the values of the last row returned on the previous
+// page, used to fetch the page that follows it. For the default ordering
+// (updated_at DESC, name DESC) it carries both values; for name ordering it
+// carries just the name.
+type After struct {
+	UpdatedAt int64
+	Name      string
 }
 
 // ListDocuments returns the org's documents of a doctype, applying equality
@@ -632,18 +648,18 @@ func listQuery(org string, id doctype.ID, opts ListOpts, cols string) (string, [
 		}
 	}
 
-	order := "updated_at"
+	order := "updated_at, name"
 	switch opts.OrderField {
 	case "", "modified", "updated_at":
-		order = "updated_at"
+		order = "updated_at, name"
 	case "creation", "created_at":
-		order = "created_at"
+		order = "created_at, name"
 	case "name":
 		order = "name"
 	case "docstatus":
 		order = "docstatus"
 	default:
-		order = "json_extract(data,'$.'||?)"
+		order = "json_extract(data,'$.'||?), name"
 	}
 	dir := "DESC"
 	if !opts.Desc {
@@ -652,6 +668,42 @@ func listQuery(org string, id doctype.ID, opts ListOpts, cols string) (string, [
 	limit := opts.Limit
 	if limit <= 0 || limit > doctype.MaxLimit {
 		limit = doctype.DefaultLimit
+	}
+
+	// Keyset paging: only rows strictly before (or after, when ascending) the
+	// last row of the previous page. Every value is a bound parameter.
+	if opts.After.UpdatedAt != 0 || opts.After.Name != "" {
+		switch opts.OrderField {
+		case "", "modified", "updated_at":
+			if opts.Desc {
+				where = append(where, "(updated_at < ? OR (updated_at = ? AND name < ?))")
+				args = append(args, opts.After.UpdatedAt, opts.After.UpdatedAt, opts.After.Name)
+			} else {
+				where = append(where, "(updated_at > ? OR (updated_at = ? AND name > ?))")
+				args = append(args, opts.After.UpdatedAt, opts.After.UpdatedAt, opts.After.Name)
+			}
+		case "name":
+			if opts.Desc {
+				where = append(where, "name < ?")
+			} else {
+				where = append(where, "name > ?")
+			}
+			args = append(args, opts.After.Name)
+		case "created_at":
+			if opts.Desc {
+				where = append(where, "created_at < ?")
+			} else {
+				where = append(where, "created_at > ?")
+			}
+			args = append(args, opts.After.UpdatedAt)
+		case "docstatus":
+			if opts.Desc {
+				where = append(where, "docstatus < ?")
+			} else {
+				where = append(where, "docstatus > ?")
+			}
+			args = append(args, opts.After.UpdatedAt)
+		}
 	}
 
 	q := `SELECT ` + cols + ` FROM fw_documents WHERE ` +

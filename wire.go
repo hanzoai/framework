@@ -1,6 +1,7 @@
 package framework
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -82,6 +83,9 @@ type ListQuery struct {
 	OrderBy string
 	// Limit is a positive integer; out-of-range falls back to the default.
 	Limit string
+	// Cursor is an opaque keyset cursor returned with the previous page's result.
+	// Empty means the first page.
+	Cursor string
 }
 
 // ParseListQuery validates a raw list query against a DocType, returning the
@@ -93,6 +97,12 @@ type ListQuery struct {
 // JSON path. An unknown field is a validation error, not a silent no-op.
 func ParseListQuery(dt *doctype.DocType, q ListQuery) (ListOpts, []string, error) {
 	opts := ListOpts{Limit: doctype.DefaultLimit}
+
+	if raw := strings.TrimSpace(q.Cursor); raw != "" {
+		if err := parseCursor(dt, raw, &opts); err != nil {
+			return opts, nil, doctype.Errorf("cursor: %s", err)
+		}
+	}
 
 	if raw := strings.TrimSpace(q.Filters); raw != "" {
 		var f map[string]any
@@ -150,6 +160,16 @@ func queryable(dt *doctype.DocType, name string) bool {
 	return ok
 }
 
+// managedOrder reports whether the order field is a managed column (updated_at,
+// created_at, name, docstatus) rather than a declared DocType field.
+func managedOrder(order string) bool {
+	switch order {
+	case "", "modified", "updated_at", "creation", "created_at", "name", "docstatus":
+		return true
+	}
+	return false
+}
+
 func splitFields(raw string) []string {
 	// Accept a JSON array ["a","b"] or a comma list "a,b".
 	if strings.HasPrefix(raw, "[") {
@@ -166,6 +186,57 @@ func splitFields(raw string) []string {
 		}
 	}
 	return out
+}
+
+// cursorShape is the stable, self-describing encoding of a keyset cursor. It is
+// base64url (no padding) of: order-field, then the values that identify the last
+// row of the previous page. Decoding rejects anything that does not match the
+// DocType's declared ordering so a cursor cannot invent a page boundary.
+type cursorShape struct {
+	Order     string // "updated_at", "created_at", "name", or "docstatus"
+	Desc      bool
+	UpdatedAt int64
+	Name      string
+}
+
+// makeCursor encodes a keyset cursor for the last row of a page. Empty cursor =
+// first page.
+func makeCursor(order string, desc bool, after After) string {
+	if order == "" {
+		order = "updated_at"
+	}
+	shape := cursorShape{Order: order, Desc: desc, UpdatedAt: after.UpdatedAt, Name: after.Name}
+	b, _ := json.Marshal(shape)
+	return base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(b)
+}
+
+// parseCursor decodes an opaque cursor into ListOpts. A malformed cursor is a
+// validation error.
+func parseCursor(dt *doctype.DocType, raw string, opts *ListOpts) error {
+	b, err := base64.URLEncoding.WithPadding(base64.NoPadding).DecodeString(raw)
+	if err != nil {
+		return fmt.Errorf("not base64url: %w", err)
+	}
+	var shape cursorShape
+	if err := json.Unmarshal(b, &shape); err != nil {
+		return fmt.Errorf("not a cursor: %w", err)
+	}
+	if !managedOrder(shape.Order) && !queryable(dt, shape.Order) {
+		return fmt.Errorf("unknown order field: %s", shape.Order)
+	}
+	switch shape.Order {
+	case "", "modified", "updated_at":
+		opts.OrderField = "updated_at"
+	case "creation", "created_at":
+		opts.OrderField = "created_at"
+	case "name":
+		opts.OrderField = "name"
+	case "docstatus":
+		opts.OrderField = "docstatus"
+	}
+	opts.Desc = shape.Desc
+	opts.After = After{UpdatedAt: shape.UpdatedAt, Name: shape.Name}
+	return nil
 }
 
 // BindDocument decodes a document body with the engine's size guard. A host
