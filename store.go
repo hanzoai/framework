@@ -691,11 +691,11 @@ func listQuery(org string, id doctype.ID, opts ListOpts, cols string) (string, [
 			args = append(args, opts.After.Name)
 		case "created_at":
 			if opts.Desc {
-				where = append(where, "created_at < ?")
+				where = append(where, "(created_at < ? OR (created_at = ? AND name < ?))")
 			} else {
-				where = append(where, "created_at > ?")
+				where = append(where, "(created_at > ? OR (created_at = ? AND name > ?))")
 			}
-			args = append(args, opts.After.UpdatedAt)
+			args = append(args, opts.After.UpdatedAt, opts.After.UpdatedAt, opts.After.Name)
 		case "docstatus":
 			if opts.Desc {
 				where = append(where, "docstatus < ?")
@@ -706,8 +706,18 @@ func listQuery(org string, id doctype.ID, opts ListOpts, cols string) (string, [
 		}
 	}
 
+	// Apply dir to EVERY order column. `ORDER BY updated_at, name DESC` would
+	// leave updated_at ascending, which breaks the keyset predicate that assumes
+	// both columns share the same direction.
+	orderBy := ""
+	for i, col := range strings.Split(order, ", ") {
+		if i > 0 {
+			orderBy += ", "
+		}
+		orderBy += col + " " + dir
+	}
 	q := `SELECT ` + cols + ` FROM fw_documents WHERE ` +
-		strings.Join(where, " AND ") + ` ORDER BY ` + order + ` ` + dir + ` LIMIT ?`
+		strings.Join(where, " AND ") + ` ORDER BY ` + orderBy + ` LIMIT ?`
 	if strings.Contains(order, "json_extract") {
 		args = append(args, opts.OrderField)
 	}
