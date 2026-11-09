@@ -3,10 +3,8 @@ package framework
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"testing"
-
-	"github.com/hanzoai/doctype"
+	"time"
 )
 
 // TestList_WalksEveryPage keysets through >2500 docs with limit 200: exact
@@ -73,8 +71,8 @@ func TestList_EmptyList(t *testing.T) {
 	}
 }
 
-// TestList_CursorStableUnderInserts: inserting docs above the first page does
-// not shift the cursor for a page already walked.
+// TestList_CursorStableUnderInserts: inserting docs that sort above the first
+// page (newer updated_at) does not shift a page already walked.
 func TestList_CursorStableUnderInserts(t *testing.T) {
 	e := testEngine(t)
 	ctx := context.Background()
@@ -88,7 +86,7 @@ func TestList_CursorStableUnderInserts(t *testing.T) {
 		}
 	}
 
-	// Walk the first page and capture the cursor to page 2.
+	// Walk page 1 and capture the cursor to page 2.
 	first, err := e.ListDocuments(ctx, c, at("erp", "Sales Invoice"), ListOpts{Limit: 200})
 	if err != nil {
 		t.Fatalf("first page: %v", err)
@@ -99,7 +97,15 @@ func TestList_CursorStableUnderInserts(t *testing.T) {
 	last := first[len(first)-1]
 	cursor := After{UpdatedAt: last.UpdatedAt, Name: last.Name}
 
-	// Insert 300 docs that sort before page 2's boundary (newer updated_at).
+	// Page 2 before any new inserts.
+	before, err := e.ListDocuments(ctx, c, at("erp", "Sales Invoice"), ListOpts{Limit: 200, After: cursor})
+	if err != nil {
+		t.Fatalf("page 2 before: %v", err)
+	}
+	beforeNames := docNames(before)
+
+	// Insert docs strictly newer (next second) so they sort above page 1.
+	time.Sleep(time.Second)
 	inserted := make([]string, 300)
 	for i := 0; i < 300; i++ {
 		d, err := e.CreateDocument(ctx, c, at("erp", "Sales Invoice"), map[string]any{"customer": "Newer Ltd", "total": 1.0})
@@ -109,22 +115,28 @@ func TestList_CursorStableUnderInserts(t *testing.T) {
 		inserted[i] = d.Name
 	}
 
-	// The cursor to page 2 must still return the same docs as before the inserts.
-	page2, err := e.ListDocuments(ctx, c, at("erp", "Sales Invoice"), ListOpts{Limit: 200, After: cursor})
+	// Page 2 must be unchanged: same docs, none of the inserted ones.
+	afterDocs, err := e.ListDocuments(ctx, c, at("erp", "Sales Invoice"), ListOpts{Limit: 200, After: cursor})
 	if err != nil {
 		t.Fatalf("page 2 after inserts: %v", err)
 	}
-	seen := map[string]bool{}
-	for _, d := range page2 {
-		seen[d.Name] = true
+	afterNames := docNames(afterDocs)
+	if len(afterNames) != len(beforeNames) {
+		t.Fatalf("page 2 after = %d docs, want %d (cursor shifted)", len(afterNames), len(beforeNames))
 	}
-	for _, name := range inserted {
-		if seen[name] {
-			t.Fatalf("inserted doc %q leaked onto page 2 after cursor", name)
+	for i, name := range beforeNames {
+		if i >= len(afterNames) || afterNames[i] != name {
+			t.Fatalf("page 2 changed at index %d: %q vs %q", i, afterNames[i], name)
 		}
 	}
-	if len(page2) == 0 {
-		t.Fatal("page 2 empty after inserts, cursor shifted")
+	insertedSet := make(map[string]bool, len(inserted))
+	for _, name := range inserted {
+		insertedSet[name] = true
+	}
+	for _, name := range afterNames {
+		if insertedSet[name] {
+			t.Fatalf("inserted doc %q leaked onto page 2 after cursor", name)
+		}
 	}
 }
 
@@ -192,10 +204,15 @@ func TestParseListQuery_BadCursor(t *testing.T) {
 	}
 }
 
+func docNames(docs []Doc) []string {
+	out := make([]string, 0, len(docs))
+	for _, d := range docs {
+		out = append(out, d.Name)
+	}
+	return out
+}
+
 // badBase64URL returns raw (no padding) base64url of s.
 func badBase64URL(s string) string {
 	return base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString([]byte(s))
 }
-
-var _ = errors.Is
-var _ = doctype.ID{}

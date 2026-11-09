@@ -648,18 +648,18 @@ func listQuery(org string, id doctype.ID, opts ListOpts, cols string) (string, [
 		}
 	}
 
-	order := "updated_at"
+	order := "updated_at, name"
 	switch opts.OrderField {
 	case "", "modified", "updated_at":
-		order = "updated_at"
+		order = "updated_at, name"
 	case "creation", "created_at":
-		order = "created_at"
+		order = "created_at, name"
 	case "name":
 		order = "name"
 	case "docstatus":
 		order = "docstatus"
 	default:
-		order = "json_extract(data,'$.'||?)"
+		order = "json_extract(data,'$.'||?), name"
 	}
 	dir := "DESC"
 	if !opts.Desc {

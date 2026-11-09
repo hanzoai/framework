@@ -160,6 +160,16 @@ func queryable(dt *doctype.DocType, name string) bool {
 	return ok
 }
 
+// managedOrder reports whether the order field is a managed column (updated_at,
+// created_at, name, docstatus) rather than a declared DocType field.
+func managedOrder(order string) bool {
+	switch order {
+	case "", "modified", "updated_at", "creation", "created_at", "name", "docstatus":
+		return true
+	}
+	return false
+}
+
 func splitFields(raw string) []string {
 	// Accept a JSON array ["a","b"] or a comma list "a,b".
 	if strings.HasPrefix(raw, "[") {
@@ -183,10 +193,10 @@ func splitFields(raw string) []string {
 // row of the previous page. Decoding rejects anything that does not match the
 // DocType's declared ordering so a cursor cannot invent a page boundary.
 type cursorShape struct {
-	Order   string // "updated_at", "created_at", "name", or "docstatus"
-	Desc    bool
+	Order     string // "updated_at", "created_at", "name", or "docstatus"
+	Desc      bool
 	UpdatedAt int64
-	Name    string
+	Name      string
 }
 
 // makeCursor encodes a keyset cursor for the last row of a page. Empty cursor =
@@ -211,7 +221,7 @@ func parseCursor(dt *doctype.DocType, raw string, opts *ListOpts) error {
 	if err := json.Unmarshal(b, &shape); err != nil {
 		return fmt.Errorf("not a cursor: %w", err)
 	}
-	if !queryable(dt, shape.Order) {
+	if !managedOrder(shape.Order) && !queryable(dt, shape.Order) {
 		return fmt.Errorf("unknown order field: %s", shape.Order)
 	}
 	switch shape.Order {
