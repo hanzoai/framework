@@ -71,6 +71,11 @@ type Config struct {
 	File string
 	// OpenDB opens the database. Nil means the plain hanzoai/sqlite driver.
 	OpenDB OpenDBFunc
+	// Postgres says OpenDB's handle is on PostgreSQL (hanzo-sql) and not SQLite: the
+	// engine then writes numbered placeholders, keeps documents in a JSONB column and
+	// takes an advisory lock to migrate, and leaves the pragmas and the single connection
+	// to the host.
+	Postgres bool
 	// Logger is handed to lifecycle hooks as Event.Logger. Nil means a no-op logger.
 	Logger luxlog.Logger
 }
@@ -99,7 +104,7 @@ func Open(cfg Config) (*Engine, error) {
 	if name == "" {
 		name = DefaultFile
 	}
-	store, err := openStore(filepath.Join(cfg.Dir, name), cfg.OpenDB)
+	store, err := openStore(filepath.Join(cfg.Dir, name), cfg.OpenDB, cfg.Postgres)
 	if err != nil {
 		return nil, fmt.Errorf("framework.Open: %w", err)
 	}

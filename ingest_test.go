@@ -15,7 +15,7 @@ import (
 // live store to write against.
 func mountForIngest(t *testing.T) (*Engine, func()) {
 	t.Helper()
-	e, err := Open(Config{Dir: t.TempDir(), Logger: luxlog.New("test")})
+	e, err := Open(withLogger(testConfig(t), luxlog.New("test")))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

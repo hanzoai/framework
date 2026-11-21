@@ -45,7 +45,7 @@ func (s *Store) upgrade() error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf(doctypesDDL, "fw_doctypes_next")+fmt.Sprintf(documentsDDL, "fw_documents_next")); err != nil {
+	if _, err := tx.ExecContext(ctx, s.tables("fw_doctypes_next", "fw_documents_next")); err != nil {
 		return fmt.Errorf("upgrade: staging tables: %w", err)
 	}
 	moved, err := s.upgradeDocTypes(ctx, tx)
@@ -61,7 +61,7 @@ func (s *Store) upgrade() error {
 		`ALTER TABLE fw_doctypes_next RENAME TO fw_doctypes`,
 		`ALTER TABLE fw_documents_next RENAME TO fw_documents`,
 	} {
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+		if _, err := tx.ExecContext(ctx, s.bind(stmt)); err != nil {
 			return fmt.Errorf("upgrade: %s: %w", stmt, err)
 		}
 	}
@@ -87,7 +87,7 @@ func (s *Store) stale(ctx context.Context) (bool, error) {
 // which is the only thing that can tell the documents where they went.
 func (s *Store) upgradeDocTypes(ctx context.Context, tx *sql.Tx) (map[[2]string]doctype.ID, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT org,name,module,is_single,is_submittable,autoname,title_field,fields,permissions,created_at,updated_at FROM fw_doctypes`)
+		s.bind(`SELECT org,name,module,is_single,is_submittable,autoname,title_field,fields,permissions,created_at,updated_at FROM fw_doctypes`))
 	if err != nil {
 		return nil, fmt.Errorf("upgrade: read doctypes: %w", err)
 	}
@@ -125,8 +125,8 @@ func (s *Store) upgradeDocTypes(ctx context.Context, tx *sql.Tx) (map[[2]string]
 	_ = rows.Close()
 	for _, r := range kept {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO fw_doctypes_next (org,name,module,is_single,is_submittable,autoname,title_field,fields,permissions,created_at,updated_at)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+			s.bind(`INSERT INTO fw_doctypes_next (org,name,module,is_single,is_submittable,autoname,title_field,fields,permissions,created_at,updated_at)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?)`),
 			r.org, r.id.Name, r.id.Module, r.single, r.submittable, r.autoname, r.titleField,
 			r.fieldsJSON, r.permsJSON, r.created, r.updated); err != nil {
 			return nil, fmt.Errorf("upgrade: write doctype %s: %w", r.id, err)
@@ -144,7 +144,7 @@ func (s *Store) upgradeDocTypes(ctx context.Context, tx *sql.Tx) (map[[2]string]
 // the old data offers nothing else to match on, and a name two lanes both claim
 // is left alone rather than guessed at.
 func (s *Store) upgradeDocuments(ctx context.Context, tx *sql.Tx, moved map[[2]string]doctype.ID) error {
-	rows, err := tx.QueryContext(ctx, `SELECT org,doctype,name,docstatus,data,created_at,updated_at FROM fw_documents`)
+	rows, err := tx.QueryContext(ctx, s.bind(`SELECT org,doctype,name,docstatus,data,created_at,updated_at FROM fw_documents`))
 	if err != nil {
 		return fmt.Errorf("upgrade: read documents: %w", err)
 	}
@@ -185,8 +185,8 @@ func (s *Store) upgradeDocuments(ctx context.Context, tx *sql.Tx, moved map[[2]s
 	_ = rows.Close()
 	for _, r := range kept {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO fw_documents_next (org,module,doctype,name,docstatus,data,created_at,updated_at)
-			 VALUES (?,?,?,?,?,?,?,?)`,
+			s.bind(`INSERT INTO fw_documents_next (org,module,doctype,name,docstatus,data,created_at,updated_at)
+			 VALUES (?,?,?,?,?,?,?,?)`),
 			r.org, r.id.Module, r.id.Name, r.name, r.status, r.data, r.created, r.updated); err != nil {
 			return fmt.Errorf("upgrade: write document %s/%s: %w", r.id, r.name, err)
 		}

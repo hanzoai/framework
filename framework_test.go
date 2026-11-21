@@ -11,7 +11,8 @@ import (
 
 func testStore(t *testing.T) *Store {
 	t.Helper()
-	s, err := openStore(filepath.Join(t.TempDir(), "framework.db"), nil)
+	open, pg := testDB(t)
+	s, err := openStore(filepath.Join(t.TempDir(), "framework.db"), open, pg)
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -220,8 +221,14 @@ func TestNaming(t *testing.T) {
 	}
 
 	serDT := mustDocType(t, s, org, DocType{Name: "Inv", Module: "erp", Autoname: "INV-.YYYY.-.####", Fields: []DocField{{Fieldname: "a", Fieldtype: FieldData}}})
-	s1, _ := s.CreateDocument(ctx, org, &serDT, map[string]any{"a": "x"}, "")
-	s2, _ := s.CreateDocument(ctx, org, &serDT, map[string]any{"a": "y"}, "")
+	s1, err := s.CreateDocument(ctx, org, &serDT, map[string]any{"a": "x"}, "")
+	if err != nil {
+		t.Fatalf("series #1: %v", err)
+	}
+	s2, err := s.CreateDocument(ctx, org, &serDT, map[string]any{"a": "y"}, "")
+	if err != nil {
+		t.Fatalf("series #2: %v", err)
+	}
 	yr := time.Now().Year()
 	if !strings.HasPrefix(s1.Name, "INV-") || !strings.HasSuffix(s1.Name, "0001") {
 		t.Fatalf("series #1 want INV-<year>-0001, got %q", s1.Name)

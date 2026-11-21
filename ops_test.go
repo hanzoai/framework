@@ -17,7 +17,7 @@ import (
 
 func testEngine(t *testing.T) *Engine {
 	t.Helper()
-	e, err := Open(Config{Dir: t.TempDir()})
+	e, err := Open(testConfig(t))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -848,7 +848,7 @@ func TestBindDocument(t *testing.T) {
 // TestEngine_ClosedIsHonest: every entry point on a closed engine fails with a
 // clear error instead of a nil dereference.
 func TestEngine_ClosedIsHonest(t *testing.T) {
-	e, err := Open(Config{Dir: t.TempDir()})
+	e, err := Open(testConfig(t))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
