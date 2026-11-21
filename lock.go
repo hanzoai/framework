@@ -147,10 +147,11 @@ func newHolderToken() (string, error) {
 //	    holds it → not acquired. Under a race two inserters collide on the PK and exactly
 //	    one wins.
 func (s *Store) acquireLock(ctx context.Context, org, lockkey, holder string, ttl time.Duration) (bool, error) {
+	lockkey = s.keyed(lockkey)
 	now := time.Now().UnixNano()
 	expires := now + int64(ttl)
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE fw_locks SET holder=?, expires_at=? WHERE org=? AND lockkey=? AND expires_at<=?`,
+		s.bind(`UPDATE fw_locks SET holder=?, expires_at=? WHERE org=? AND lockkey=? AND expires_at<=?`),
 		holder, expires, org, lockkey, now)
 	if err != nil {
 		return false, fmt.Errorf("steal lock: %w", err)
@@ -159,7 +160,7 @@ func (s *Store) acquireLock(ctx context.Context, org, lockkey, holder string, tt
 		return true, nil
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO fw_locks (org, lockkey, holder, expires_at) VALUES (?,?,?,?)`,
+		s.bind(`INSERT INTO fw_locks (org, lockkey, holder, expires_at) VALUES (?,?,?,?)`),
 		org, lockkey, holder, expires)
 	if err == nil {
 		return true, nil
@@ -173,9 +174,20 @@ func (s *Store) acquireLock(ctx context.Context, org, lockkey, holder string, tt
 // releaseLock frees (org, lockkey) IFF `holder` still owns it. Holder-scoping means a
 // holder whose lease was already reclaimed by TTL cannot delete the new owner's row.
 func (s *Store) releaseLock(ctx context.Context, org, lockkey, holder string) error {
+	lockkey = s.keyed(lockkey)
 	if _, err := s.db.ExecContext(ctx,
-		`DELETE FROM fw_locks WHERE org=? AND lockkey=? AND holder=?`, org, lockkey, holder); err != nil {
+		s.bind(`DELETE FROM fw_locks WHERE org=? AND lockkey=? AND holder=?`), org, lockkey, holder); err != nil {
 		return fmt.Errorf("release lock: %w", err)
 	}
 	return nil
+}
+
+// keyed is a lock key as the column holds it: a key's parts are joined with NUL, which
+// PostgreSQL text cannot hold, so there it is stored in hex, which keeps two keys apart as
+// the bytes did.
+func (s *Store) keyed(key string) string {
+	if s.pg {
+		return hex.EncodeToString([]byte(key))
+	}
+	return key
 }

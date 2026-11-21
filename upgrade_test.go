@@ -122,7 +122,7 @@ func TestUpgradeMovesEveryRowOntoItsAddress(t *testing.T) {
 		putOldDocument(t, db, "other", "kb-page", "welcome")       // another tenant, same key
 	})
 
-	s, err := openStore(path, nil)
+	s, err := openStore(path, nil, false)
 	if err != nil {
 		t.Fatalf("openStore (upgrade): %v", err)
 	}
@@ -213,7 +213,7 @@ func TestUpgradeRunsOnce(t *testing.T) {
 	id := doctype.ID{Module: "kb", Name: "page"}
 
 	for i := range 3 {
-		s, err := openStore(path, nil)
+		s, err := openStore(path, nil, false)
 		if err != nil {
 			t.Fatalf("open %d: %v", i, err)
 		}

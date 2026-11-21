@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,31 +27,55 @@ import (
 // serializes writes against the single-writer SQLite file.
 type Store struct {
 	db *sql.DB
+	pg bool // the handle is on PostgreSQL (hanzo-sql), else SQLite
+}
+
+// bind writes q for the engine the store is on: SQLite reads the ? placeholders as written,
+// PostgreSQL the numbered $n.
+func (s *Store) bind(q string) string { return bind(s.pg, q) }
+
+func bind(pg bool, q string) string {
+	if !pg {
+		return q
+	}
+	var b strings.Builder
+	n := 0
+	for i := 0; i < len(q); i++ {
+		if q[i] == '?' {
+			n++
+			b.WriteString("$" + strconv.Itoa(n))
+			continue
+		}
+		b.WriteByte(q[i])
+	}
+	return b.String()
 }
 
 // openStore opens (and migrates) the engine's database. `open` is the host's
 // opener — nil means the plain hanzoai/sqlite driver, which is what a
 // standalone app or a test wants; Hanzo Cloud injects an encrypted-at-rest one.
-func openStore(path string, open OpenDBFunc) (*Store, error) {
+func openStore(path string, open OpenDBFunc, pg bool) (*Store, error) {
 	if open == nil {
 		open = func(p string) (*sql.DB, error) { return sql.Open("sqlite", p) }
 	}
 	db, err := open(path)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
+		return nil, fmt.Errorf("open %q: %w", path, err)
 	}
-	db.SetMaxOpenConns(1)
-	for _, pragma := range []string{
-		"PRAGMA busy_timeout=5000",
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA foreign_keys=ON",
-	} {
-		if _, err := db.Exec(pragma); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("pragma %q: %w", pragma, err)
+	if !pg {
+		db.SetMaxOpenConns(1)
+		for _, pragma := range []string{
+			"PRAGMA busy_timeout=5000",
+			"PRAGMA journal_mode=WAL",
+			"PRAGMA foreign_keys=ON",
+		} {
+			if _, err := db.Exec(pragma); err != nil {
+				_ = db.Close()
+				return nil, fmt.Errorf("pragma %q: %w", pragma, err)
+			}
 		}
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, pg: pg}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -68,13 +93,37 @@ func openStore(path string, open OpenDBFunc) (*Store, error) {
 // the key, not a column beside it, which is what makes two lanes' "page" two rows
 // instead of a collision.
 func (s *Store) migrate() error {
+	if s.pg {
+		return s.migratePostgres(context.Background())
+	}
 	if err := s.upgrade(); err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(fmt.Sprintf(doctypesDDL, "fw_doctypes") + fmt.Sprintf(documentsDDL, "fw_documents") + indexDDL); err != nil {
+	if _, err := s.db.Exec(s.schema("fw_doctypes", "fw_documents")); err != nil {
 		return fmt.Errorf("framework migrate: %w", err)
 	}
 	return s.widen(context.Background())
+}
+
+// migrationLock is the advisory lock a PostgreSQL migration takes, so two pods starting
+// together do not race CREATE TABLE IF NOT EXISTS, which is not safe against itself.
+const migrationLock = 0x66774d69 // "fwMi"
+
+// migratePostgres creates the schema in one transaction holding migrationLock. A database
+// born here never held the SQLite shape upgrade rebuilds, so there is nothing to upgrade.
+func (s *Store) migratePostgres(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("framework migrate: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrationLock); err != nil {
+		return fmt.Errorf("framework migrate: lock: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, s.schema("fw_doctypes", "fw_documents")); err != nil {
+		return fmt.Errorf("framework migrate: %w", err)
+	}
+	return tx.Commit()
 }
 
 // widen adds a column to a table that already exists, which CREATE TABLE IF NOT
@@ -93,7 +142,7 @@ func (s *Store) widen(ctx context.Context) error {
 		if cols[add.column] {
 			continue
 		}
-		if _, err := s.db.ExecContext(ctx, add.ddl); err != nil {
+		if _, err := s.db.ExecContext(ctx, s.bind(add.ddl)); err != nil {
 			return fmt.Errorf("framework migrate: %s.%s: %w", add.table, add.column, err)
 		}
 	}
@@ -102,7 +151,11 @@ func (s *Store) widen(ctx context.Context) error {
 
 // columns is a table's column names, empty for a table that does not exist.
 func (s *Store) columns(ctx context.Context, table string) (map[string]bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
+	q := `SELECT name FROM pragma_table_info(?)`
+	if s.pg {
+		q = `SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ?`
+	}
+	rows, err := s.db.QueryContext(ctx, s.bind(q), table)
 	if err != nil {
 		return nil, fmt.Errorf("read schema: %w", err)
 	}
@@ -120,7 +173,8 @@ func (s *Store) columns(ctx context.Context, table string) (map[string]bool, err
 
 // The schema, one template per table so the upgrade (upgrade.go) stages the
 // SAME definition under a temporary name — a second copy of these columns is
-// how a rebuilt table comes to differ from a freshly created one.
+// how a rebuilt table comes to differ from a freshly created one. A document's data
+// is JSONB on PostgreSQL, so SQL can look inside it with ->>, and text on SQLite.
 const (
 	doctypesDDL = `
 CREATE TABLE IF NOT EXISTS %s (
@@ -134,8 +188,8 @@ CREATE TABLE IF NOT EXISTS %s (
   title_field    TEXT NOT NULL DEFAULT '',
   fields         TEXT NOT NULL DEFAULT '[]',
   permissions    TEXT NOT NULL DEFAULT '[]',
-  created_at     INTEGER NOT NULL,
-  updated_at     INTEGER NOT NULL,
+  created_at     BIGINT NOT NULL,
+  updated_at     BIGINT NOT NULL,
   PRIMARY KEY (org, module, name)
 );
 `
@@ -146,9 +200,9 @@ CREATE TABLE IF NOT EXISTS %s (
   doctype    TEXT NOT NULL,
   name       TEXT NOT NULL,
   docstatus  INTEGER NOT NULL DEFAULT 0,
-  data       TEXT NOT NULL DEFAULT '{}',
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
+  data       %s NOT NULL DEFAULT '{}',
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL,
   PRIMARY KEY (org, module, doctype, name)
 );
 `
@@ -160,7 +214,7 @@ CREATE INDEX IF NOT EXISTS ix_fw_documents_updated ON fw_documents(org, module, 
 CREATE TABLE IF NOT EXISTS fw_series (
   org     TEXT NOT NULL,
   series  TEXT NOT NULL,
-  current INTEGER NOT NULL DEFAULT 0,
+  current BIGINT NOT NULL DEFAULT 0,
   PRIMARY KEY (org, series)
 );
 
@@ -168,11 +222,29 @@ CREATE TABLE IF NOT EXISTS fw_locks (
   org        TEXT NOT NULL,
   lockkey    TEXT NOT NULL,
   holder     TEXT NOT NULL,
-  expires_at INTEGER NOT NULL,   -- unix nanos; a lease auto-expires so a crashed holder never wedges
+  expires_at BIGINT NOT NULL,   -- unix nanos; a lease auto-expires so a crashed holder never wedges
   PRIMARY KEY (org, lockkey)
 );
 `
 )
+
+// dataType is the type of a document's data column on the engine.
+func (s *Store) dataType() string {
+	if s.pg {
+		return "JSONB"
+	}
+	return "TEXT"
+}
+
+// tables is the DDL of the two tables under the given names.
+func (s *Store) tables(doctypes, documents string) string {
+	return fmt.Sprintf(doctypesDDL, doctypes) + fmt.Sprintf(documentsDDL, documents, s.dataType())
+}
+
+// schema is tables under their own names, and the rest.
+func (s *Store) schema(doctypes, documents string) string {
+	return s.tables(doctypes, documents) + indexDDL
+}
 
 // Close closes the underlying database. Idempotent-safe via sql.DB.
 func (s *Store) Close() error { return s.db.Close() }
@@ -186,8 +258,8 @@ func (s *Store) CreateDocType(ctx context.Context, org string, dt DocType) (DocT
 	fieldsJSON, _ := json.Marshal(dt.Fields)
 	permsJSON, _ := json.Marshal(dt.Perms)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO fw_doctypes (org,name,module,is_single,is_submittable,immutable,autoname,title_field,fields,permissions,created_at,updated_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		s.bind(`INSERT INTO fw_doctypes (org,name,module,is_single,is_submittable,immutable,autoname,title_field,fields,permissions,created_at,updated_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`),
 		org, dt.Name, dt.Module, b2i(dt.IsSingle), b2i(dt.IsSubmittable), b2i(dt.Immutable), dt.Autoname, dt.TitleField,
 		string(fieldsJSON), string(permsJSON), now, now)
 	if err != nil {
@@ -242,8 +314,8 @@ func (s *Store) GetDocType(ctx context.Context, org string, id doctype.ID) (DocT
 // stored is the definition the org's row holds, exactly as written.
 func (s *Store) stored(ctx context.Context, org string, id doctype.ID) (DocType, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT name,module,is_single,is_submittable,immutable,autoname,title_field,fields,permissions,created_at,updated_at
-		 FROM fw_doctypes WHERE org=? AND module=? AND name=?`, org, id.Module, id.Name)
+		s.bind(`SELECT name,module,is_single,is_submittable,immutable,autoname,title_field,fields,permissions,created_at,updated_at
+		 FROM fw_doctypes WHERE org=? AND module=? AND name=?`), org, id.Module, id.Name)
 	dt, err := scanDocType(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return DocType{}, ErrNotFound
@@ -258,7 +330,7 @@ func (s *Store) stored(ctx context.Context, org string, id doctype.ID) (DocType,
 // of the module's DocTypes.
 func (s *Store) holds(ctx context.Context, org, module string) (bool, error) {
 	var one int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM fw_doctypes WHERE org=? AND module=? LIMIT 1`, org, module).Scan(&one)
+	err := s.db.QueryRowContext(ctx, s.bind(`SELECT 1 FROM fw_doctypes WHERE org=? AND module=? LIMIT 1`), org, module).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -301,8 +373,8 @@ func current(dt DocType) DocType {
 
 func (s *Store) ListDocTypes(ctx context.Context, org string) ([]DocType, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT name,module,is_single,is_submittable,immutable,autoname,title_field,fields,permissions,created_at,updated_at
-		 FROM fw_doctypes WHERE org=? ORDER BY name ASC`, org)
+		s.bind(`SELECT name,module,is_single,is_submittable,immutable,autoname,title_field,fields,permissions,created_at,updated_at
+		 FROM fw_doctypes WHERE org=? ORDER BY name ASC`), org)
 	if err != nil {
 		return nil, fmt.Errorf("list doctypes: %w", err)
 	}
@@ -356,8 +428,8 @@ func (s *Store) ReplaceDocType(ctx context.Context, org string, dt DocType) (Doc
 	permsJSON, _ := json.Marshal(dt.Perms)
 	now := time.Now().Unix()
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE fw_doctypes SET module=?,is_single=?,is_submittable=?,immutable=?,autoname=?,title_field=?,fields=?,permissions=?,updated_at=?
-		 WHERE org=? AND module=? AND name=?`,
+		s.bind(`UPDATE fw_doctypes SET module=?,is_single=?,is_submittable=?,immutable=?,autoname=?,title_field=?,fields=?,permissions=?,updated_at=?
+		 WHERE org=? AND module=? AND name=?`),
 		dt.Module, b2i(dt.IsSingle), b2i(dt.IsSubmittable), b2i(dt.Immutable), dt.Autoname, dt.TitleField,
 		string(fieldsJSON), string(permsJSON), now, org, dt.Module, dt.Name)
 	if err != nil {
@@ -377,11 +449,11 @@ func (s *Store) DeleteDocType(ctx context.Context, org string, id doctype.ID) (b
 		return false, fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	res, err := tx.ExecContext(ctx, `DELETE FROM fw_doctypes WHERE org=? AND module=? AND name=?`, org, id.Module, id.Name)
+	res, err := tx.ExecContext(ctx, s.bind(`DELETE FROM fw_doctypes WHERE org=? AND module=? AND name=?`), org, id.Module, id.Name)
 	if err != nil {
 		return false, fmt.Errorf("delete doctype: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM fw_documents WHERE org=? AND module=? AND doctype=?`, org, id.Module, id.Name); err != nil {
+	if _, err := tx.ExecContext(ctx, s.bind(`DELETE FROM fw_documents WHERE org=? AND module=? AND doctype=?`), org, id.Module, id.Name); err != nil {
 		return false, fmt.Errorf("delete documents: %w", err)
 	}
 	n, _ := res.RowsAffected()
@@ -442,7 +514,7 @@ func (s *Store) CreateDocument(ctx context.Context, org string, dt *DocType, dat
 
 	insert := func(ctx context.Context, x execer, name string) error {
 		_, err := x.ExecContext(ctx,
-			`INSERT INTO fw_documents (org,module,doctype,name,docstatus,data,created_at,updated_at) VALUES (?,?,?,?,0,?,?,?)`,
+			s.bind(`INSERT INTO fw_documents (org,module,doctype,name,docstatus,data,created_at,updated_at) VALUES (?,?,?,?,0,?,?,?)`),
 			org, dt.Module, dt.Name, name, string(blob), now, now)
 		return err
 	}
@@ -455,7 +527,7 @@ func (s *Store) CreateDocument(ctx context.Context, org string, dt *DocType, dat
 			return Document{}, fmt.Errorf("begin: %w", err)
 		}
 		defer func() { _ = tx.Rollback() }()
-		n, err := nextSeries(ctx, tx, org, ser.Key)
+		n, err := s.nextSeries(ctx, tx, org, ser.Key)
 		if err != nil {
 			return Document{}, err
 		}
@@ -495,8 +567,8 @@ func (s *Store) UpsertSingle(ctx context.Context, org string, dt *DocType, data 
 		return Document{}, fmt.Errorf("marshal data: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO fw_documents (org,module,doctype,name,docstatus,data,created_at,updated_at) VALUES (?,?,?,?,0,?,?,?)
-		 ON CONFLICT(org,module,doctype,name) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at`,
+		s.bind(`INSERT INTO fw_documents (org,module,doctype,name,docstatus,data,created_at,updated_at) VALUES (?,?,?,?,0,?,?,?)
+		 ON CONFLICT(org,module,doctype,name) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at`),
 		org, dt.Module, dt.Name, dt.Name, string(blob), now, now)
 	if err != nil {
 		return Document{}, fmt.Errorf("upsert single: %w", err)
@@ -506,7 +578,7 @@ func (s *Store) UpsertSingle(ctx context.Context, org string, dt *DocType, data 
 
 func (s *Store) GetDocument(ctx context.Context, org string, id doctype.ID, name string) (Document, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT name,docstatus,data,created_at,updated_at FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`,
+		s.bind(`SELECT name,docstatus,data,created_at,updated_at FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`),
 		org, id.Module, id.Name, name)
 	d, err := scanDocument(row, id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -550,15 +622,15 @@ type After struct {
 }
 
 // ListDocuments returns the org's documents of a doctype, applying equality
-// filters (via json_extract, all values BOUND), an order key, and a bounded
+// filters (via ->>, all values BOUND), an order key, and a bounded
 // limit. Every value is a bound parameter and every field name is validated
 // against the doctype's schema before it reaches a json path.
 func (s *Store) ListDocuments(ctx context.Context, org string, id doctype.ID, opts ListOpts) ([]Document, error) {
-	q, args, any := listQuery(org, id, opts, "name,docstatus,data,created_at,updated_at")
+	q, args, any := listQuery(s.pg, org, id, opts, "name,docstatus,data,created_at,updated_at")
 	if !any {
 		return []Document{}, nil
 	}
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.db.QueryContext(ctx, s.bind(q), args...)
 	if err != nil {
 		return nil, fmt.Errorf("list documents: %w", err)
 	}
@@ -579,11 +651,11 @@ func (s *Store) ListDocuments(ctx context.Context, org string, id doctype.ID, op
 // customer's estate is made of — otherwise pays the JSON of every document to
 // learn a name the row carries in a column of its own.
 func (s *Store) ListNames(ctx context.Context, org string, id doctype.ID, opts ListOpts) ([]string, error) {
-	q, args, any := listQuery(org, id, opts, "name")
+	q, args, any := listQuery(s.pg, org, id, opts, "name")
 	if !any {
 		return []string{}, nil
 	}
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.db.QueryContext(ctx, s.bind(q), args...)
 	if err != nil {
 		return nil, fmt.Errorf("list names: %w", err)
 	}
@@ -599,9 +671,20 @@ func (s *Store) ListNames(ctx context.Context, org string, id doctype.ID, opts L
 	return out, rows.Err()
 }
 
+// status is a docstatus filter value as the column compares it: PostgreSQL will not compare
+// an integer column with text, so a value that is not a number matches nothing there, as it
+// does on SQLite.
+func status(pg bool, v string) (any, bool) {
+	if !pg {
+		return v, true
+	}
+	n, err := strconv.Atoi(v)
+	return n, err == nil
+}
+
 // listQuery builds one list read over `cols`. It answers false when the query
 // can match nothing, which is what a field named with an empty set means.
-func listQuery(org string, id doctype.ID, opts ListOpts, cols string) (string, []any, bool) {
+func listQuery(pg bool, org string, id doctype.ID, opts ListOpts, cols string) (string, []any, bool) {
 	var (
 		where = []string{"org=?", "module=?", "doctype=?"}
 		args  = []any{org, id.Module, id.Name}
@@ -612,11 +695,15 @@ func listQuery(org string, id doctype.ID, opts ListOpts, cols string) (string, [
 			where = append(where, "name=?")
 			args = append(args, val)
 		case "docstatus":
+			v, ok := status(pg, val)
+			if !ok {
+				return "", nil, false
+			}
 			where = append(where, "docstatus=?")
-			args = append(args, val)
+			args = append(args, v)
 		default:
-			// json_extract's path arg is a BOUND concatenation — no interpolation.
-			where = append(where, "CAST(json_extract(data,'$.'||?) AS TEXT)=?")
+			// The field name is a bound label — no interpolation.
+			where = append(where, "CAST(data->>? AS TEXT)=?")
 			args = append(args, field, val)
 		}
 	}
@@ -640,10 +727,18 @@ func listQuery(org string, id doctype.ID, opts ListOpts, cols string) (string, [
 		case "docstatus":
 			where = append(where, "docstatus IN ("+marks+")")
 		default:
-			where = append(where, "CAST(json_extract(data,'$.'||?) AS TEXT) IN ("+marks+")")
+			where = append(where, "CAST(data->>? AS TEXT) IN ("+marks+")")
 			args = append(args, field)
 		}
 		for _, v := range vals {
+			if field == "docstatus" {
+				n, ok := status(pg, v)
+				if !ok {
+					return "", nil, false
+				}
+				args = append(args, n)
+				continue
+			}
 			args = append(args, v)
 		}
 	}
@@ -659,7 +754,7 @@ func listQuery(org string, id doctype.ID, opts ListOpts, cols string) (string, [
 	case "docstatus":
 		order = "docstatus"
 	default:
-		order = "json_extract(data,'$.'||?), name"
+		order = "CAST(data->>? AS TEXT), name"
 	}
 	dir := "DESC"
 	if !opts.Desc {
@@ -718,7 +813,7 @@ func listQuery(org string, id doctype.ID, opts ListOpts, cols string) (string, [
 	}
 	q := `SELECT ` + cols + ` FROM fw_documents WHERE ` +
 		strings.Join(where, " AND ") + ` ORDER BY ` + orderBy + ` LIMIT ?`
-	if strings.Contains(order, "json_extract") {
+	if strings.Contains(order, "data->>?") {
 		args = append(args, opts.OrderField)
 	}
 	return q, append(args, limit), true
@@ -738,7 +833,7 @@ func (s *Store) UpdateDocument(ctx context.Context, org string, dt *DocType, nam
 	}
 	defer func() { _ = tx.Rollback() }()
 	var status int
-	err = tx.QueryRowContext(ctx, `SELECT docstatus FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`,
+	err = tx.QueryRowContext(ctx, s.bind(`SELECT docstatus FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`),
 		org, dt.Module, dt.Name, name).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Document{}, ErrNotFound
@@ -750,7 +845,7 @@ func (s *Store) UpdateDocument(ctx context.Context, org string, dt *DocType, nam
 		return Document{}, ErrBadState
 	}
 	now := time.Now().Unix()
-	if _, err := tx.ExecContext(ctx, `UPDATE fw_documents SET data=?, updated_at=? WHERE org=? AND module=? AND doctype=? AND name=?`,
+	if _, err := tx.ExecContext(ctx, s.bind(`UPDATE fw_documents SET data=?, updated_at=? WHERE org=? AND module=? AND doctype=? AND name=?`),
 		string(blob), now, org, dt.Module, dt.Name, name); err != nil {
 		return Document{}, fmt.Errorf("update document: %w", err)
 	}
@@ -771,7 +866,7 @@ func (s *Store) SetDocStatus(ctx context.Context, org string, id doctype.ID, nam
 	}
 	defer func() { _ = tx.Rollback() }()
 	var status int
-	err = tx.QueryRowContext(ctx, `SELECT docstatus FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`,
+	err = tx.QueryRowContext(ctx, s.bind(`SELECT docstatus FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`),
 		org, id.Module, id.Name, name).Scan(&status)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Document{}, ErrNotFound
@@ -783,7 +878,7 @@ func (s *Store) SetDocStatus(ctx context.Context, org string, id doctype.ID, nam
 		return Document{}, ErrBadState
 	}
 	now := time.Now().Unix()
-	if _, err := tx.ExecContext(ctx, `UPDATE fw_documents SET docstatus=?, updated_at=? WHERE org=? AND module=? AND doctype=? AND name=?`,
+	if _, err := tx.ExecContext(ctx, s.bind(`UPDATE fw_documents SET docstatus=?, updated_at=? WHERE org=? AND module=? AND doctype=? AND name=?`),
 		to, now, org, id.Module, id.Name, name); err != nil {
 		return Document{}, fmt.Errorf("set docstatus: %w", err)
 	}
@@ -796,7 +891,7 @@ func (s *Store) SetDocStatus(ctx context.Context, org string, id doctype.ID, nam
 // DeleteDocument removes a document by key. Returns false if absent. The service
 // enforces the lifecycle guard (a submitted doc must be cancelled first).
 func (s *Store) DeleteDocument(ctx context.Context, org string, id doctype.ID, name string) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`, org, id.Module, id.Name, name)
+	res, err := s.db.ExecContext(ctx, s.bind(`DELETE FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`), org, id.Module, id.Name, name)
 	if err != nil {
 		return false, fmt.Errorf("delete document: %w", err)
 	}
@@ -807,7 +902,7 @@ func (s *Store) DeleteDocument(ctx context.Context, org string, id doctype.ID, n
 // CountDocuments returns the org's document count for a doctype (real, per-org).
 func (s *Store) CountDocuments(ctx context.Context, org string, id doctype.ID) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM fw_documents WHERE org=? AND module=? AND doctype=?`, org, id.Module, id.Name).Scan(&n)
+	err := s.db.QueryRowContext(ctx, s.bind(`SELECT COUNT(*) FROM fw_documents WHERE org=? AND module=? AND doctype=?`), org, id.Module, id.Name).Scan(&n)
 	return n, err
 }
 
@@ -837,7 +932,7 @@ func (s *Store) documentExists(ctx context.Context, org string, id doctype.ID, n
 	}
 	var one int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT 1 FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`, org, id.Module, id.Name, name).Scan(&one)
+		s.bind(`SELECT 1 FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name=?`), org, id.Module, id.Name, name).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -854,7 +949,7 @@ func (s *Store) documentExists(ctx context.Context, org string, id doctype.ID, n
 func (s *Store) fieldValueTaken(ctx context.Context, org string, id doctype.ID, field, value, excludeName string) (bool, error) {
 	var one int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT 1 FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name<>? AND CAST(json_extract(data,'$.'||?) AS TEXT)=? LIMIT 1`,
+		s.bind(`SELECT 1 FROM fw_documents WHERE org=? AND module=? AND doctype=? AND name<>? AND CAST(data->>? AS TEXT)=? LIMIT 1`),
 		org, id.Module, id.Name, excludeName, field, value).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -870,14 +965,15 @@ func (s *Store) fieldValueTaken(ctx context.Context, org string, id doctype.ID, 
 // nextSeries atomically increments and returns the per-org counter for a series
 // key. Runs inside the caller's create transaction so the counter and the insert
 // commit together (no gaps on rollback, no collisions across concurrent creates).
-func nextSeries(ctx context.Context, tx *sql.Tx, org, key string) (int64, error) {
+func (s *Store) nextSeries(ctx context.Context, tx *sql.Tx, org, key string) (int64, error) {
+	key = s.keyed(key)
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO fw_series (org,series,current) VALUES (?,?,1)
-		 ON CONFLICT(org,series) DO UPDATE SET current = current + 1`, org, key); err != nil {
+		s.bind(`INSERT INTO fw_series (org,series,current) VALUES (?,?,1)
+		 ON CONFLICT(org,series) DO UPDATE SET current = fw_series.current + 1`), org, key); err != nil {
 		return 0, fmt.Errorf("bump series: %w", err)
 	}
 	var n int64
-	if err := tx.QueryRowContext(ctx, `SELECT current FROM fw_series WHERE org=? AND series=?`, org, key).Scan(&n); err != nil {
+	if err := tx.QueryRowContext(ctx, s.bind(`SELECT current FROM fw_series WHERE org=? AND series=?`), org, key).Scan(&n); err != nil {
 		return 0, fmt.Errorf("read series: %w", err)
 	}
 	return n, nil
@@ -899,10 +995,15 @@ func b2i(b bool) int {
 	return 0
 }
 
-// isUnique reports whether err is a SQLite UNIQUE/primary-key violation.
+// isUnique reports whether err is a UNIQUE/primary-key violation: PostgreSQL's SQLSTATE 23505, or
+// SQLite's message.
 func isUnique(err error) bool {
 	if err == nil {
 		return false
+	}
+	var pg interface{ SQLState() string }
+	if errors.As(err, &pg) {
+		return pg.SQLState() == "23505"
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unique constraint") || strings.Contains(msg, "constraint failed")
