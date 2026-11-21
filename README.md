@@ -1,5 +1,7 @@
 # Hanzo Framework
 
+[![Open in Hanzo](https://hanzo.app/badges/open-in-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/framework&ref=main&action=open) [![Edit with Hanzo](https://hanzo.app/badges/edit-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/framework&ref=main&action=edit) [![Deploy with Hanzo](https://hanzo.app/badges/deploy-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/framework&ref=main&action=deploy)
+
 The metadata-driven DocType engine: native Go on SQLite, Frappe's document engine rebuilt
 with no Frappe or Python runtime.
 
